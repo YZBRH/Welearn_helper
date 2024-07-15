@@ -1,0 +1,4 @@
+requests
+asyncio
+bs4
+typing
