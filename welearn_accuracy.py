@@ -8,7 +8,8 @@ session = requests.Session()
 print("**********  Created By Avenshy & SSmJaE  **********")
 print("                 刷完成Version:0.4dev")
 print("         原作者github https://github.com/Avenshy")
-print("                              BR更新--2024.04.17")
+print("         更新维护者github https://github.com/YZBRH/Welearn_helper/")
+print("                              BR更新--2024.12.1")
 print("***************************************************\n")
 
 def printline():
@@ -107,11 +108,11 @@ while True:
     url = f"https://welearn.sflep.com/student/course_info.aspx?cid={cid}"
     response = session.get(url)
     script = BeautifulSoup(response.text, "html.parser").find_all("script")[13]
-    uid = re.search(r"uid=(\d+)", script.text).group(1)
-    classid = re.search(r"classid=(\d+)", script.text).group(1)
+    # uid = re.search(r"uid=(\d+)", script.text).group(1)
+    # classid = re.search(r"classid=(\d+)", script.text).group(1)
 
-    # uid = re.search('"uid":(.*?),', response.text).group(1)
-    # classid = re.search('"classid":"(.*?)"', response.text).group(1)
+    uid = re.search('"uid":(.*?),', response.text).group(1)
+    classid = re.search('"classid":"(.*?)"', response.text).group(1)
     # ---------以上修改---------------------
 
     url = 'https://welearn.sflep.com/ajax/StudyStat.aspx'
