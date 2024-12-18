@@ -10,6 +10,21 @@ import base64
 
 import requests
 
+REQUEST_INTERVAL = 2
+HEARTBEAT_INTERVAL = 1
+AJAX_URL = "https://welearn.sflep.com/Ajax/SCO.aspx"
+
+cid: str
+uid: str
+classid: str
+courseInfo: List[Any]
+unitIndex: int
+targetTime: Union['int', List['int']]
+
+errors: List[str] = []
+maxLearningTime: int = 0
+session = requests.Session()
+
 print("**********  Created By Avenshy & SSmJaE  **********")
 print("                 刷完成Version:0.4dev")
 print("         原作者github https://github.com/Avenshy")
@@ -364,23 +379,7 @@ async def main():
         watcher()
     )
 
-
-if __name__ == "__main__":
-    REQUEST_INTERVAL = 2
-    HEARTBEAT_INTERVAL = 1
-    AJAX_URL = "https://welearn.sflep.com/Ajax/SCO.aspx"
-
-    cid: str
-    uid: str
-    classid: str
-    courseInfo: List[Any]
-    unitIndex: int
-    targetTime: Union['int', List['int']]
-
-    errors: List[str] = []
-    maxLearningTime: int = 0
-    session = requests.Session()
-
+def welearn_time_run():
     user = input("请输入用户名=>")
     pwd = input("请输入密码=>")
 
