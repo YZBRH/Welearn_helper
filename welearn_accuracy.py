@@ -5,16 +5,9 @@ from random import randint
 from bs4 import BeautifulSoup
 import time
 session = requests.Session()
-print("**********  Created By Avenshy & SSmJaE  **********")
-print("                 刷完成Version:0.4dev")
-print("         原作者github https://github.com/Avenshy")
-print("         更新维护者github https://github.com/YZBRH/Welearn_helper/")
-print("                              BR更新--2024.12.1")
-print("***************************************************\n")
 
 def printline():
     print('-'*51)
-
 
 # ---------以下修改---------------------
 def to_hex_byte_array(byte_array):
@@ -43,36 +36,42 @@ def generate_cipher_text(password):
 def login(user, pwd):
     while True:
         try:
-            response = requests.get(
-                "https://welearn.sflep.com/user/prelogin.aspx?loginret=http://welearn.sflep.com/user/loginredirect.aspx")
+            response = requests.get("https://welearn.sflep.com/user/prelogin.aspx?loginret=http://welearn.sflep.com/user/loginredirect.aspx")
             code_challenge = response.url.split("%26")[4].split("%3D")[1]
             state = response.url.split("%26")[6].split("%3D")[1]
             rturl = f"/connect/authorize/callback?client_id=welearn_web&redirect_uri=https%3A%2F%2Fwelearn.sflep.com%2Fsignin-sflep&response_type=code&scope=openid%20profile%20email%20phone%20address&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&x-client-SKU=ID_NET472&x-client-ver=6.32.1.0"
             # 获取回调url
             print("登录中...", end='')
             while True:
-                msg = generate_cipher_text(pwd)
+                enpwd = generate_cipher_text(pwd)
 
                 form_data = {
                     "rturl": rturl,
                     "account": user,
-                    "pwd": str(msg[0]),
-                    "ts": str(msg[1])
+                    "pwd": str(enpwd[0]),
+                    "ts": str(enpwd[1])
                 }
-                if("帐号或密码错误" in session.post("https://sso.sflep.com/idsvr/account/login", data=form_data).text):
+
+                response = session.post("https://sso.sflep.com/idsvr/account/login", data=form_data)
+                # print(response.json())
+                
+                code = response.json().get("code", -1)
+
+                if code == 1:
                     print("\n帐号或密码错误！")
                     exit(0)
-                session.get(
-                    "https://welearn.sflep.com/user/prelogin.aspx?loginret=http://welearn.sflep.com/user/loginredirect.aspx")
-                # 登录
 
-                response = session.get("https://welearn.sflep.com/student/index.aspx")
-                if "WE Learn 随行课堂" in response.text:
-                    print(f"\n登录成功！")
+                session.get("https://welearn.sflep.com/user/prelogin.aspx?loginret=http://welearn.sflep.com/user/loginredirect.aspx")
+                # response = session.get("https://welearn.sflep.com/student/index.aspx")
+
+                if code == 0:
+                    print("\n登录成功！")
                     return session
+                
                 print(".", end='')
         except:
             print("错误返回,登录失败！")
+            print(f"返回信息：{response.json().get('msg', '未知错误')}")
             exit(0)
 # ---------以上修改---------------------
 
@@ -108,7 +107,7 @@ def welearn_accuracy_run():
         # ---------以下修改---------------------
         url = f"https://welearn.sflep.com/student/course_info.aspx?cid={cid}"
         response = session.get(url)
-        script = BeautifulSoup(response.text, "html.parser").find_all("script")[13]
+        # script = BeautifulSoup(response.text, "html.parser").find_all("script")[13]
         # uid = re.search(r"uid=(\d+)", script.text).group(1)
         # classid = re.search(r"classid=(\d+)", script.text).group(1)
 
