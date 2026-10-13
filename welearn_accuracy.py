@@ -63,11 +63,13 @@ class AccuracyTask:
         }
 
         if unit_index == 0:
-            start, end = 0, len(self.units)
+            unit = 0
+            advance_until_error = True   # 原版语义:持续探测下一单元,直到服务器报错才终止
         else:
-            start, end = unit_index - 1, unit_index
+            unit = unit_index - 1
+            advance_until_error = False
 
-        for unit in range(start, end):
+        while True:
             if self._stopped():
                 break
             response = self.session.get(
@@ -131,6 +133,10 @@ class AccuracyTask:
                                 f'方式2:{"成功!!!" if way2_ok else "失败!!!"}')
                 else:  # 章节已完成
                     self.on_log(f'[ 已完成 ]    {course["location"]}')
+
+            if not advance_until_error:
+                break
+            unit += 1
 
         return {'way1_succeed': way1_succeed, 'way1_failed': way1_failed,
                 'way2_succeed': way2_succeed, 'way2_failed': way2_failed}

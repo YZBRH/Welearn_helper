@@ -167,6 +167,7 @@ class WelearnApp:
             messagebox.showwarning("提示", "请输入账号和密码")
             return
         self._set_running(True, "登录中...")
+        self.stop_event.clear()   # 此前点过"停止"不得阻塞新的登录
         mode = self.mode_var.get()
 
         def work():
@@ -206,6 +207,7 @@ class WelearnApp:
             messagebox.showwarning("提示", "请先登录")
             return
         self._set_running(True, "刷新课程中...")
+        self.stop_event.clear()
 
         def work():
             try:
@@ -241,6 +243,7 @@ class WelearnApp:
             return
         cid = course["cid"]
         self._set_running(True, "加载单元中...")
+        self.stop_event.clear()
 
         def work():
             try:

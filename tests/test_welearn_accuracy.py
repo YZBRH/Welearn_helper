@@ -7,9 +7,35 @@ def make_task(fake, chapters):
     task.session = fake
     task.cid, task.uid, task.classid = "C1", "U1", "K1"
     task.units = [{"unitname": "U1", "name": "Unit One", "visible": "true"}]
-    fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
-        FakeResponse(json_data={"info": chapters})
+
+    def scoleaves(url, data):
+        # 复刻真实服务器语义:unitidx=0 返回单元数据,越界(>=1)返回错误文本终止遍历
+        if "unitidx=0" in url:
+            return FakeResponse(json_data={"info": chapters})
+        return FakeResponse(text="出错了")
+
+    fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = scoleaves
     return task
+
+
+class TestUnitIteration:
+    def test_all_units_run_until_server_error(self):
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = FakeResponse(text='{"ret":0}')
+
+        task = make_task(fake, chapters=[])   # units 长度 1
+
+        def scoleaves(url, data):
+            if "unitidx=1" in url:
+                return FakeResponse(text="出错了")
+            return FakeResponse(json_data={"info": [
+                {"id": 1, "location": "L1", "isvisible": "true", "iscomplete": "未完成"}]})
+
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = scoleaves
+        result = task.run(0, 100)
+        urls = [r[1] for r in fake.requests]
+        assert any("unitidx=1" in u for u in urls), "原版会持续探测直到服务器报错才终止"
+        assert result["way1_succeed"] == 1
 
 
 class TestRun:

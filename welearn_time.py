@@ -47,6 +47,10 @@ class TimeTask:
 
     def fetch_units(self, cid) -> List[dict]:
         self.cid = str(cid)
+        # 与原实现一致:先请求 /2019/ 页面(响应弃用,保持请求序列),再请求解析 uid/classid 的页面
+        self.session.get(
+            'https://welearn.sflep.com/2019/student/course_info.aspx?cid=' + self.cid,
+            headers={'Referer': 'https://welearn.sflep.com/2019/student/index.aspx'})
         self.uid, self.classid = welearn_common.get_course_ids(self.session, self.cid)
         self.units = welearn_common.fetch_units(self.session, self.cid, self.uid)
         return self.units

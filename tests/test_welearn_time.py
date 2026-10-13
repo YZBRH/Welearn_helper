@@ -23,6 +23,24 @@ def ok_ajax_response():
     return FakeResponse(json_data={"comment": json.dumps({"cmi": cmi})})
 
 
+class TestFetchUnits:
+    def test_keeps_original_request_sequence(self):
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/2019/student/course_info.aspx"] = \
+            FakeResponse(text="page")
+        fake.routes["https://welearn.sflep.com/student/course_info.aspx"] = FakeResponse(
+            text='var d = {"uid":7,"n":1}; "classid":"K9"')
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx"] = \
+            FakeResponse(json_data={"info": []})   # courseunits 走 params,FakeSession 记录裸 URL
+        task = welearn_time.TimeTask("u", "p", on_log=lambda m: None)
+        task.session = fake
+        task.fetch_units("55")
+        urls = [r[1] for r in fake.requests]
+        i2019 = urls.index("https://welearn.sflep.com/2019/student/course_info.aspx?cid=55")
+        iparse = urls.index("https://welearn.sflep.com/student/course_info.aspx?cid=55")
+        assert i2019 < iparse, "原版先请求 /2019/ 页面(响应弃用)再请求解析页"
+
+
 class TestRun:
     def test_counts_chapters(self):
         fake = FakeSession()
