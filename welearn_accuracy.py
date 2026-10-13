@@ -1,265 +1,212 @@
-import re
-import base64
+import threading
 from random import randint
-import time
-import tls_client
-session = tls_client.Session(client_identifier="chrome_120", debug=False)
+from typing import Any, Callable, Dict, List, Optional
 
-def printline():
-    print('-'*51)
+import welearn_common
+from welearn_common import LoginError, WelearnError
 
-# ---------以下修改---------------------
+AJAX_URL = "https://welearn.sflep.com/Ajax/SCO.aspx"
 
-
-def to_hex_byte_array(byte_array):
-    return ''.join([f'{byte:02x}' for byte in byte_array])
-
-
-def generate_cipher_text(password):
-    # 获取当前时间戳（毫秒级）
-    T0 = int(round(time.time() * 1000)) # 不清楚原因，网站和本地间有延迟，需手动补齐延迟
-    # 模拟TextEncoder.encode
-    P = password.encode('utf-8')
-    V = (T0 >> 16) & 0xFF
-    for byte in P:
-        V ^= byte
-    remainder = V % 100
-    T1 = int((T0 / 100) * 100 + remainder)
-    P1 = to_hex_byte_array(P)
-    S = f"{T1}*" + P1
-    S_encoded = S.encode('utf-8')
-    # 模拟btoa
-    E = base64.b64encode(S_encoded).decode('utf-8')
-    return [E, T1]
+# 伪造的完成数据报文(与原实现逐字一致,{crate} 为占位)
+SCO_DATA_TEMPLATE = ('{"cmi":{"completion_status":"completed","interactions":[],"launch_data":"",'
+                     '"progress_measure":"1","score":{"scaled":"{crate}","raw":"100"},'
+                     '"session_time":"0","success_status":"unknown","total_time":"0","mode":"normal"},'
+                     '"adl":{"data":[]},"cci":{"data":[],"service":{"dictionary":{"headword":"",'
+                     '"short_cuts":""},"new_words":[],"notes":[],"writing_marking":[],"record":'
+                     '{"files":[]},"play":{"offline_media_id":"9999"}},"retry_count":"0",'
+                     '"submit_time":""}}[INTERACTIONINFO]')
 
 
-# 登录
-def login(user, pwd):
-    while True:
-        try:
-            response = session.get("https://welearn.sflep.com/user/prelogin.aspx?loginret=http://welearn.sflep.com/user/loginredirect.aspx")
-            rurl = response.headers.get('Location')
-
-            code_challenge = rurl.split("&")[4].split("=")[1]
-            state = rurl.split("&")[6].split("=")[1]
-
-            rturl = f"/connect/authorize/callback?client_id=welearn_web&redirect_uri=https%3A%2F%2Fwelearn.sflep.com%2Fsignin-sflep&response_type=code&scope=openid%20profile%20email%20phone%20address&code_challenge={code_challenge}&code_challenge_method=S256&state={state}&x-client-SKU=ID_NET472&x-client-ver=6.32.1.0"
-            # 获取回调url
-            print("登录中...", end='')
-            while True:
-                enpwd = generate_cipher_text(pwd)
-
-                form_data = {
-                    "rturl": rturl,
-                    "account": user,
-                    "pwd": str(enpwd[0]),
-                    "ts": str(enpwd[1])
-                }
-
-                response = session.post("https://sso.sflep.com/idsvr/account/login", data=form_data)
-                
-                rt_json = response.json()
-                code = rt_json.get("code", -1)
-
-                if code == -1:
-                    continue
-
-                if code == 1:
-                    print("\n帐号或密码错误！")
-                    exit(0)
-
-                next_url = f"https://sso.sflep.com/idsvr"+rt_json.get("data")
-
-                while True:
-                    resp = session.get(next_url)
-                    if resp.status_code in (301, 302, 303, 307, 308):
-                        next_url = resp.headers.get("Location", None)
-                        if not next_url:
-                            break
-                        # print(f"Redirecting to: {next_url} (status: {resp.status_code})")
-                    else:
-                        break
+def _default_log(msg):
+    print(msg)
 
 
-                if code == 0:
-                    print("\n登录成功！")
-                    return session
-                
-                print(".", end='')
-        except Exception as e:
-            print("错误返回,登录失败！")
-            print(f"错误信息：{e}, 返回信息：{response.text}")
-            exit(0)
-# ---------以上修改---------------------
+class AccuracyTask:
+    """刷完成度正确率任务控制器(CLI 与 GUI 共用)。所有输出经 on_log 回调,可在工作线程中调用。"""
 
-def welearn_accuracy_run():
-    user = input("请输入用户名=>")
-    pwd = input("请输入密码=>")
-    login(user, pwd)
-    printline()
-    while True:
-        # 查询课程信息
-        url = "https://welearn.sflep.com/ajax/authCourse.aspx?action=gmc"
-        # response = session.get(
-        #     url, headers={"Referer": "https://welearn.sflep.com/2019/student/index.aspx"})
-        response = session.get(url, headers={"Referer": "https://welearn.sflep.com/2019/student/index.aspx"})
+    def __init__(self, username: str, password: str,
+                 on_log: Optional[Callable[[str], None]] = None,
+                 stop_event: Optional[threading.Event] = None):
+        self.username = username
+        self.password = password
+        self.on_log = on_log or _default_log
+        self.stop_event = stop_event or threading.Event()
+        self.session = welearn_common.new_session()
+        self.cid = ''
+        self.uid = ''
+        self.classid = ''
+        self.units: List[Any] = []
 
-        if '\"clist\":[]}' in response.text:
-            input('发生错误!!!可能是登录错误或没有课程!!!')
-            exit(0)
-        else:
-            print('查询课程成功!!!')
-            printline()
-            print('我的课程: \n')
+    def _stopped(self) -> bool:
+        return self.stop_event.is_set()
 
-        back = response.json()["clist"]
-        for i, course in enumerate(back, start=1):
-            print(f'[NO.{i:>2}] 完成度{course["per"]:>3}% {course["name"]}')
+    def login(self) -> None:
+        welearn_common.login(self.session, self.username, self.password,
+                             on_log=self.on_log, stop_event=self.stop_event)
 
-        # 选择课程
-        order = int(input("\n请输入需要完成的课程序号（上方[]内的数字）: "))
-        cid = back[order - 1]["cid"]
-        printline()
-        print("获取单元中...")
-        printline()
-        # 刷课模块
+    def fetch_courses(self) -> List[dict]:
+        return welearn_common.fetch_courses(self.session)
 
-        # ---------以下修改---------------------
-        url = f"https://welearn.sflep.com/student/course_info.aspx?cid={cid}"
-        response = session.get(url)
-        # script = BeautifulSoup(response.text, "html.parser").find_all("script")[13]
-        # uid = re.search(r"uid=(\d+)", script.text).group(1)
-        # classid = re.search(r"classid=(\d+)", script.text).group(1)
+    def fetch_units(self, cid) -> List[dict]:
+        self.cid = str(cid)
+        self.uid, self.classid = welearn_common.get_course_ids(self.session, self.cid)
+        self.units = welearn_common.fetch_units(self.session, self.cid, self.uid)
+        return self.units
 
-        uid = re.search('"uid":(.*?),', response.text).group(1)
-        classid = re.search('"classid":"(.*?)"', response.text).group(1)
-        # ---------以上修改---------------------
+    def run(self, unit_index: int, param) -> Dict[str, Any]:
+        random_mode = isinstance(param, tuple)
+        way1_succeed, way2_succeed = 0, 0
+        way1_failed, way2_failed = 0, 0
 
-        url = 'https://welearn.sflep.com/ajax/StudyStat.aspx'
-        response = session.get(url, params={'action': 'courseunits', 'cid': cid, 'uid': uid},
-                               headers={'Referer': 'https://welearn.sflep.com/2019/student/course_info.aspx'})
-        back = response.json()['info']
-
-        # 选择单元 使用了WELearnToSleeep的代码
-        print('[NO. 0]  按顺序完成全部单元课程')
-        unitsnum = len(back)
-        for i, x in enumerate(back, start=1):
-            if x['visible'] == 'true':
-                print(f'[NO.{i:>2d}]  [已开放]  {x["unitname"]}  {x["name"]}')
-            else:
-                print(f'[NO.{i:>2d}] ![未开放]! {x["unitname"]}  {x["name"]}')
-        unitidx = int(input('\n\n请选择需要完成的单元序号（上方[]内的数字，输入0为按顺序刷全部单元）： '))
-        printline()
-        inputcrate = input(
-            '模式1:每个练习指定正确率，请直接输入指定的正确率\n如:希望每个练习正确率均为100，则输入 100\n\n模式2:每个练习随机正确率，请输入正确率上下限并用英文逗号隔开\n如:希望每个练习正确率为70～100，则输入 70,100\n\n请严格按照以上格式输入每个练习的正确率: ')
-        if ',' in inputcrate:
-            mycrate = eval(inputcrate)
-            randommode = True
-        else:
-            mycrate = inputcrate
-            randommode = False
-        printline()
-        # 伪造请求
-        way1Succeed, way2Succeed, way1Failed, way2Failed = 0, 0, 0, 0
-
-        ajaxUrl = "https://welearn.sflep.com/Ajax/SCO.aspx"
-        infoHeaders = {
-            "Referer": f"https://welearn.sflep.com/2019/student/course_info.aspx?cid={cid}",
+        info_headers = {
+            "Referer": f"https://welearn.sflep.com/2019/student/course_info.aspx?cid={self.cid}",
         }
 
-        if (unitidx == 0):
-            i = 0
+        if unit_index == 0:
+            start, end = 0, len(self.units)
         else:
-            i = unitidx - 1
-            unitsnum = unitidx
+            start, end = unit_index - 1, unit_index
 
-        while True:
-            response = session.get(
-                f'https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves&cid={cid}&uid={uid}&unitidx={i}&classid={classid}',
-                headers=infoHeaders)
+        for unit in range(start, end):
+            if self._stopped():
+                break
+            response = self.session.get(
+                f'https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves&cid={self.cid}&uid={self.uid}&unitidx={unit}&classid={self.classid}',
+                headers=info_headers)
 
             if "异常" in response.text or "出错了" in response.text:
                 break
 
             for course in response.json()["info"]:
+                if self._stopped():
+                    break
                 if course['isvisible'] == 'false':  # 跳过未开放课程
-                    print(f'[!!跳过!!]    {course["location"]}')
+                    self.on_log(f'[!!跳过!!]    {course["location"]}')
                 elif "未" in course["iscomplete"]:  # 章节未完成
-                    print(f'[即将完成]    {course["location"]}')
-                    if randommode is True:
-                        crate = str(randint(mycrate[0], mycrate[1]))
+                    self.on_log(f'[即将完成]    {course["location"]}')
+                    if random_mode:
+                        crate = str(randint(param[0], param[1]))
                     else:
-                        crate = mycrate
-                    data = '{"cmi":{"completion_status":"completed","interactions":[],"launch_data":"","progress_measure":"1","score":{"scaled":"' + crate + '","raw":"100"},"session_time":"0","success_status":"unknown","total_time":"0","mode":"normal"},"adl":{"data":[]},"cci":{"data":[],"service":{"dictionary":{"headword":"","short_cuts":""},"new_words":[],"notes":[],"writing_marking":[],"record":{"files":[]},"play":{"offline_media_id":"9999"}},"retry_count":"0","submit_time":""}}[INTERACTIONINFO]'
+                        crate = str(param)
+                    data = SCO_DATA_TEMPLATE.replace('{crate}', crate)
+                    sco_headers = {
+                        "Referer": f"https://welearn.sflep.com/Student/StudyCourse.aspx?cid={self.cid}&classid={self.classid}&sco={course['id']}"}
 
-                    id = course["id"]
-                    session.post(ajaxUrl, data={"action": "startsco160928",
-                                                "cid": cid,
-                                                "scoid": id,
-                                                "uid": uid
-                                                },
-                                 headers={
-                                     "Referer": f"https://welearn.sflep.com/Student/StudyCourse.aspx?cid={cid}&classid={classid}&sco={id}"})
-                    response = session.post(ajaxUrl, data={"action": "setscoinfo",
-                                                           "cid": cid,
-                                                           "scoid": id,
-                                                           "uid": uid,
-                                                           "data": data,
-                                                           "isend": "False"},
-                                            headers={
-                                                "Referer": f"https://welearn.sflep.com/Student/StudyCourse.aspx?cid={cid}&classid={classid}&sco={id}"})
-                    print(f'>>>>>>>>>>>>>>正确率:{crate:>3}%', end='  ')
-                    if '"ret":0' in response.text:
-                        print("方式1:成功!!!", end="  ")
-                        way1Succeed += 1
+                    self.session.post(AJAX_URL, data={"action": "startsco160928",
+                                                      "cid": self.cid,
+                                                      "scoid": course["id"],
+                                                      "uid": self.uid},
+                                      headers=sco_headers)
+                    response = self.session.post(AJAX_URL, data={"action": "setscoinfo",
+                                                                 "cid": self.cid,
+                                                                 "scoid": course["id"],
+                                                                 "uid": self.uid,
+                                                                 "data": data,
+                                                                 "isend": "False"},
+                                                 headers=sco_headers)
+                    way1_ok = '"ret":0' in response.text
+                    if way1_ok:
+                        way1_succeed += 1
                     else:
-                        print("方式1:失败!!!", end="  ")
-                        way1Failed += 1
+                        way1_failed += 1
 
-                    response = session.post(ajaxUrl, data={"action": "savescoinfo160928",
-                                                           "cid": cid,
-                                                           "scoid": id,
-                                                           "uid": uid,
-                                                           "progress": "100",
-                                                           "crate": crate,
-                                                           "status": "unknown",
-                                                           "cstatus": "completed",
-                                                           "trycount": "0",
-                                                           },
-                                            headers={
-                                                "Referer": f"https://welearn.sflep.com/Student/StudyCourse.aspx?cid={cid}&classid={classid}&sco={id}"})
-                    #                sleep(1) # 延迟1秒防止服务器压力过大
-                    if '"ret":0' in response.text:
-                        print("方式2:成功!!!")
-                        way2Succeed += 1
+                    response = self.session.post(AJAX_URL, data={"action": "savescoinfo160928",
+                                                                 "cid": self.cid,
+                                                                 "scoid": course["id"],
+                                                                 "uid": self.uid,
+                                                                 "progress": "100",
+                                                                 "crate": crate,
+                                                                 "status": "unknown",
+                                                                 "cstatus": "completed",
+                                                                 "trycount": "0",
+                                                                 },
+                                                 headers=sco_headers)
+                    way2_ok = '"ret":0' in response.text
+                    if way2_ok:
+                        way2_succeed += 1
                     else:
-                        print("方式2:失败!!!")
-                        way2Failed += 1
+                        way2_failed += 1
+                    self.on_log(f'>>>>>>>>>>>>>>正确率:{crate:>3}%  '
+                                f'方式1:{"成功!!!" if way1_ok else "失败!!!"}  '
+                                f'方式2:{"成功!!!" if way2_ok else "失败!!!"}')
                 else:  # 章节已完成
-                    print(f'[ 已完成 ]    {course["location"]}')
+                    self.on_log(f'[ 已完成 ]    {course["location"]}')
 
-            if unitidx != 0:
-                break
+        return {'way1_succeed': way1_succeed, 'way1_failed': way1_failed,
+                'way2_succeed': way2_succeed, 'way2_failed': way2_failed}
+
+
+def _printline():
+    print('-' * 51)
+
+
+def welearn_accuracy_run():
+    user = input("请输入用户名=>")
+    pwd = input("请输入密码=>")
+    task = AccuracyTask(user, pwd)
+    try:
+        task.login()
+    except (LoginError, WelearnError) as e:
+        print(e)
+        exit(0)
+    _printline()
+    while True:
+        try:
+            courses = task.fetch_courses()
+        except WelearnError as e:
+            input(str(e))
+            exit(0)
+        print('查询课程成功!!!')
+        _printline()
+        print('我的课程: \n')
+
+        for i, course in enumerate(courses, start=1):
+            print(f'[NO.{i:>2}] 完成度{course["per"]:>3}% {course["name"]}')
+
+        order = int(input("\n请输入需要完成的课程序号(上方[]内的数字): "))
+        cid = courses[order - 1]["cid"]
+        _printline()
+        print("获取单元中...")
+        _printline()
+
+        units = task.fetch_units(cid)
+
+        print('[NO. 0]  按顺序完成全部单元课程')
+        for i, x in enumerate(units, start=1):
+            if x['visible'] == 'true':
+                print(f'[NO.{i:>2d}]  [已开放]  {x["unitname"]}  {x["name"]}')
             else:
-                i += 1
+                print(f'[NO.{i:>2d}] ![未开放]! {x["unitname"]}  {x["name"]}')
+        unitidx = int(input('\n\n请选择需要完成的单元序号(上方[]内的数字,输入0为按顺序刷全部单元): '))
+        _printline()
+        inputcrate = input(
+            '模式1:每个练习指定正确率,请直接输入指定的正确率\n如:希望每个练习正确率均为100,则输入 100\n\n模式2:每个练习随机正确率,请输入正确率上下限并用英文逗号隔开\n如:希望每个练习正确率为70~100,则输入 70,100\n\n请严格按照以上格式输入每个练习的正确率: ')
+        try:
+            mycrate = welearn_common.parse_numeric_param(inputcrate)
+        except ValueError:
+            print("格式异常")
+            exit(0)
+        _printline()
+
+        result = task.run(unitidx, mycrate)
+
         if unitidx == 0:
             break
-        else:
-            print('本单元运行完毕！回到选课处！！\n\n\n\n')
-            printline()
+        print('本单元运行完毕!回到选课处!!\n\n\n\n')
+        _printline()
 
-    printline()
+    _printline()
     print(f"""
     ***************************************************
     全部完成!!
 
     总计:
-    方式1: {way1Succeed} 成功, {way1Failed} 失败
-    方式2: {way2Succeed} 成功, {way2Failed} 失败
+    方式1: {result['way1_succeed']} 成功, {result['way1_failed']} 失败
+    方式2: {result['way2_succeed']} 成功, {result['way2_failed']} 失败
 
     https://github.com/Avenshy/WELearnToSleep
-    本软件遵守GPLv3协议，且免费、开源，禁止售卖!
-    本软件遵守GPLv3协议，且免费、开源，禁止售卖!
-    本软件遵守GPLv3协议，且免费、开源，禁止售卖!
+    本软件遵守GPLv3协议,且免费、开源,禁止售卖!
+    本软件遵守GPLv3协议,且免费、开源,禁止售卖!
+    本软件遵守GPLv3协议,且免费、开源,禁止售卖!
     **********  Created By Avenshy & SSmJaE  **********""")
     input("Press any key to exit...")
