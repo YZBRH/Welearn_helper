@@ -1,2 +1,2 @@
-python -u main.py
+py -u web_gui.py
 pause
