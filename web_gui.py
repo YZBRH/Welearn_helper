@@ -40,6 +40,7 @@ class AppState:
         self.sections_unit = 0
         self.running = False
         self.running_what = "待命"
+        self.fetching = False       # 课程/单元/小节拉取进行中(与任务运行区分)
         self.last_result: Optional[dict] = None
         self.logs: Deque[Tuple[int, str, str]] = deque(maxlen=2000)
         self._log_seq = 0
@@ -56,6 +57,21 @@ class AppState:
         with self.lock:
             self.running = running
             self.running_what = running_what
+
+    def _hint(self, what: str):
+        """只更新状态文本,不改变 running(避免拉取瞬态被误判为任务运行)"""
+        with self.lock:
+            self.running_what = what
+
+    def _fetch_begin(self, hint: str):
+        with self.lock:
+            self.fetching = True
+        self._hint(hint)
+
+    def _fetch_end(self):
+        with self.lock:
+            self.fetching = False
+        self._hint("待命")
 
 
 def _format_result(mode: str, result: dict) -> List[str]:
@@ -90,29 +106,29 @@ def create_app():
         if state.worker_busy():
             return jsonify(ok=False, error="任务正在进行,请先停止"), 409
         state.stop_event.clear()   # 此前点过"停止"不得阻塞新的登录
-        state._set(True, "登录中...")
+        state._hint("登录中...")
         cls = welearn_accuracy.AccuracyTask if mode == "accuracy" else welearn_time.TimeTask
         task = cls(username, password, on_log=state.log, stop_event=state.stop_event)
         try:
             task.login()
             courses = task.fetch_courses()
         except (LoginError, WelearnError) as e:
-            msg = str(e)
-            state._set(False, "待命")
-            state.log(f"登录失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._hint("待命")
+            state.log(f"登录失败:{e}")
+            return jsonify(ok=False, error=str(e))
         except Exception as e:
-            msg = repr(e)
-            state._set(False, "待命")
-            state.log(f"登录失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._hint("待命")
+            state.log(f"登录失败:{e!r}")
+            return jsonify(ok=False, error=repr(e))
         with state.lock:
             state.task = task
             state.mode = mode
             state.courses = courses
             state.units = []
+            state.sections = []
+            state.sections_unit = 0
             state.last_result = None
-        state._set(False, "待命")
+        state._hint("待命")
         state.log(f"共 {len(courses)} 门课程,请在课程列表中选择")
         return jsonify(ok=True, courses=courses)
 
@@ -122,25 +138,24 @@ def create_app():
         cid = payload.get("cid")
         if state.task is None:
             return jsonify(ok=False, error="请先登录"), 400
-        if state.worker_busy():
+        if state.running:
             return jsonify(ok=False, error="任务正在进行,请先停止"), 409
         state.stop_event.clear()
-        state._set(True, "加载单元中...")
+        state._fetch_begin("加载单元中...")
         try:
             units = state.task.fetch_units(cid)
         except (LoginError, WelearnError) as e:
-            msg = str(e)
-            state._set(False, "待命")
-            state.log(f"加载单元失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._fetch_end()
+            state.log(f"加载单元失败:{e}")
+            return jsonify(ok=False, error=str(e))
         except Exception as e:
-            msg = repr(e)
-            state._set(False, "待命")
-            state.log(f"加载单元失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._fetch_end()
+            state.log(f"加载单元失败:{e!r}")
+            return jsonify(ok=False, error=repr(e))
+        finally:
+            state._fetch_end()   # 幂等:正常/异常路径都确保清除拉取标记
         with state.lock:
             state.units = units
-        state._set(False, "待命")
         state.log(f"已加载 {len(units)} 个单元")
         return jsonify(ok=True, units=units)
 
@@ -148,33 +163,31 @@ def create_app():
     def api_refresh():
         if state.task is None:
             return jsonify(ok=False, error="请先登录"), 400
-        if state.worker_busy():
+        if state.running:
             return jsonify(ok=False, error="任务正在进行,请先停止"), 409
         state.stop_event.clear()
-        state._set(True, "刷新课程中...")
+        state._fetch_begin("刷新课程中...")
         try:
             courses = state.task.fetch_courses()
         except (LoginError, WelearnError) as e:
-            msg = str(e)
-            state._set(False, "待命")
-            state.log(f"刷新失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._fetch_end()
+            state.log(f"刷新失败:{e}")
+            return jsonify(ok=False, error=str(e))
         except Exception as e:
-            msg = repr(e)
-            state._set(False, "待命")
-            state.log(f"刷新失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._fetch_end()
+            state.log(f"刷新失败:{e!r}")
+            return jsonify(ok=False, error=repr(e))
+        finally:
+            state._fetch_end()
         with state.lock:
             state.courses = courses
-            state.units = []
-        state._set(False, "待命")
         state.log(f"已刷新,共 {len(courses)} 门课程")
         return jsonify(ok=True, courses=courses)
 
     @app.route("/api/logout", methods=["POST"])
     def api_logout():
         """作废当前登录(切换模式时调用):旧 task 不得再用新参数运行"""
-        if state.worker_busy():
+        if state.worker_busy() or state.fetching:
             return jsonify(ok=False, error="任务正在进行,请先停止"), 409
         with state.lock:
             state.task = None
@@ -200,21 +213,21 @@ def create_app():
         if not 1 <= unit_index <= len(state.units):
             return jsonify(ok=False,
                            error=f"请选择具体单元(1~{len(state.units)});0=全部,无单独小节可显示"), 400
-        if state.worker_busy():
+        if state.running:
             return jsonify(ok=False, error="任务正在进行,请先停止"), 409
-        state._set(True, "加载小节中...")
+        state._fetch_begin("加载小节中...")
         try:
             raw = state.task.fetch_sections(unit_index)
         except (LoginError, WelearnError) as e:
-            msg = str(e)
-            state._set(False, "待命")
-            state.log(f"加载小节失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._fetch_end()
+            state.log(f"加载小节失败:{e}")
+            return jsonify(ok=False, error=str(e))
         except Exception as e:
-            msg = repr(e)
-            state._set(False, "待命")
-            state.log(f"加载小节失败:{msg}")
-            return jsonify(ok=False, error=msg)
+            state._fetch_end()
+            state.log(f"加载小节失败:{e!r}")
+            return jsonify(ok=False, error=repr(e))
+        finally:
+            state._fetch_end()
         sections = [{"location": x.get("location", ""),
                      "complete": "未" not in x.get("iscomplete", "未"),
                      "visible": x.get("isvisible", "true") != "false"} for x in raw]
@@ -273,7 +286,7 @@ def create_app():
                 state.log(line)
 
         with state.lock:   # 忙检查与线程登记同锁,防止并发请求双双通过后重复起线程
-            if state.worker_busy():
+            if state.worker_busy() or state.fetching:
                 return jsonify(ok=False, error="任务正在进行,请先停止"), 409
             state.worker = threading.Thread(target=work, daemon=True)
         state.worker.start()
@@ -409,9 +422,10 @@ function setControls(running) {
   $('stopBtn').disabled = !busy;
 }
 
-function fillCourses(list) {
+function fillCourses(list, keepSelection) {
   courses = list || [];
   var sel = $('courseSel');
+  var prev = keepSelection ? sel.value : '';
   sel.innerHTML = '';
   if (!courses.length) {
     sel.appendChild(new Option('-- 无课程 --', ''));
@@ -420,6 +434,11 @@ function fillCourses(list) {
   for (var i = 0; i < courses.length; i++) {
     var c = courses[i];
     sel.appendChild(new Option('完成度' + c.per + '%  ' + c.name, String(c.cid)));
+  }
+  if (prev) {   // 刷新后恢复原选择,避免用户重新点一遍
+    for (var k = 0; k < sel.options.length; k++) {
+      if (sel.options[k].value === prev) { sel.value = prev; break; }
+    }
   }
 }
 
@@ -491,6 +510,48 @@ function appendLocal(text) {
   box.scrollTop = box.scrollHeight;
 }
 
+function loadSections(unitIndex) {
+  apiPost('/api/sections', {unit_index: unitIndex})
+    .then(function (j) {
+      if (!j.ok) { renderSections(null); appendLocal('加载小节失败:' + j.error); return; }
+      renderSections(j.sections);
+    })
+    .catch(function (err) { renderSections(null); appendLocal('请求失败:' + err); });
+}
+
+function restoreUnitSelection(prev) {
+  var sel = $('unitSel');
+  if (!prev) return;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === prev) { sel.value = prev; break; }
+  }
+  if (sel.value === prev) {
+    $('unitIndex').value = prev;
+    if (prev !== '0') loadSections(Number(prev));
+  }
+}
+
+/* 刷新课程(保留选择);若已选课程则连单元一起刷新并恢复单元/小节选择 */
+function refreshAll(kind) {
+  apiPost('/api/refresh', {})
+    .then(function (j) {
+      if (!j.ok) { if (kind === 'manual') alert('刷新失败\n' + j.error); return; }
+      fillCourses(j.courses, true);
+      if (!$('courseSel').value) { fillUnits([]); return; }
+      var prevUnit = $('unitSel').value;
+      apiPost('/api/units', {cid: Number($('courseSel').value)})
+        .then(function (j2) {
+          if (!j2.ok) { fillUnits([]); return; }
+          fillUnits(j2.units);
+          restoreUnitSelection(prevUnit);
+        })
+        .catch(function () {});
+    })
+    .catch(function (err) {
+      if (kind === 'manual') alert('请求失败:' + err);
+    });
+}
+
 document.querySelectorAll('input[name=mode]').forEach(function (radio) {
   radio.addEventListener('change', function () {
     fillCourses([]);
@@ -508,24 +569,32 @@ $('loginBtn').addEventListener('click', function () {
   var username = $('username').value.trim();
   var password = $('password').value;
   if (!username || !password) { alert('请输入账号和密码'); return; }
+  var prevCourse = $('courseSel').value;
+  var prevUnit = $('unitSel').value;
   apiPost('/api/login', {username: username, password: password, mode: getMode()})
     .then(function (j) {
       if (!j.ok) { alert('登录失败\n' + j.error); return; }
       window.__hasTask = true;
-      fillCourses(j.courses);
+      fillCourses(j.courses, true);
+      if (prevCourse && $('courseSel').value === prevCourse && prevUnit) {
+        /* 重新登录且课程未变:自动恢复单元与小节,无需重选 */
+        apiPost('/api/units', {cid: Number(prevCourse)})
+          .then(function (j2) {
+            if (!j2.ok) { fillUnits([]); return; }
+            fillUnits(j2.units);
+            restoreUnitSelection(prevUnit);
+          })
+          .catch(function () { fillUnits([]); });
+      } else {
+        fillUnits([]);
+      }
       setControls(false);
     })
     .catch(function (err) { alert('请求失败:' + err); });
 });
 
 $('refreshBtn').addEventListener('click', function () {
-  apiPost('/api/refresh', {})
-    .then(function (j) {
-      if (!j.ok) { alert('刷新失败\n' + j.error); return; }
-      fillCourses(j.courses);
-      fillUnits([]);
-    })
-    .catch(function (err) { alert('请求失败:' + err); });
+  refreshAll('manual');
 });
 
 $('courseSel').addEventListener('change', function () {
@@ -544,12 +613,7 @@ $('unitSel').addEventListener('change', function () {
   if (v !== '') $('unitIndex').value = v;
   $('sectionIndex').value = '0';   // 编号随单元重置,防止旧小节id误用
   if (v && v !== '0') {
-    apiPost('/api/sections', {unit_index: Number(v)})
-      .then(function (j) {
-        if (!j.ok) { renderSections(null); appendLocal('加载小节失败:' + j.error); return; }
-        renderSections(j.sections);
-      })
-      .catch(function (err) { renderSections(null); appendLocal('请求失败:' + err); });
+    loadSections(Number(v));
   } else {
     renderSections(null);
   }
@@ -574,11 +638,19 @@ $('stopBtn').addEventListener('click', function () {
   apiPost('/api/stop', {}).catch(function (err) { alert('请求失败:' + err); });
 });
 
+var wasRunning = false;
+
 function poll() {
   fetch('/api/status?after=' + lastSeq)
     .then(function (r) { return r.json(); })
     .then(function (j) {
       appendLogs(j.logs);
+      if (wasRunning && !j.running) {
+        /* 任务刚结束:课程完成度与小节状态已变,自动刷新(保留全部选择) */
+        appendLocal('[界面] 任务结束,自动刷新课程与小节状态...');
+        refreshAll('task-end');
+      }
+      wasRunning = j.running;
       window.__hasTask = j.has_task;
       $('statusText').textContent = j.running_what;
       setControls(j.running);

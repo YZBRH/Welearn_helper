@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -234,6 +235,38 @@ class TestStartSection:
                                        "section_index": 99})
         assert r.status_code == 400
         assert "1~2" in r.get_json()["error"]
+
+
+class TestRefreshAfterTaskEnd:
+    def test_units_not_rejected_while_worker_draining(self, client):
+        """任务结束(running已False)但工作线程尚未退出时,刷新单元不得409"""
+        c, state = client
+        login(client)
+        state.worker = threading.Thread(target=time.sleep, args=(1.0,), daemon=True)
+        state.worker.start()
+        state.running = False   # 模拟 work() 已置 False、线程将退未退
+        r = c.post("/api/units", json={"cid": 11})
+        assert r.status_code == 200
+
+    def test_login_clears_stale_units_and_sections(self, client):
+        """重新登录必须作废上一会话的单元与小节,防止界面残留旧状态"""
+        c, state = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        c.post("/api/sections", json={"unit_index": 1})
+        assert state.units and state.sections
+        login(client)
+        assert state.units == [] and state.sections == []
+        assert state.sections_unit == 0
+
+    def test_start_rejected_while_fetch_in_flight(self, client):
+        """单元/课程拉取进行中(fetching)时不得开任务,避免并发用同一会话"""
+        c, state = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        state.fetching = True   # 模拟一次拉取正在进行
+        r = c.post("/api/start", json={"unit_index": 1, "param": "100"})
+        assert r.status_code == 409
 
 
 class TestStatusLogs:
