@@ -9,7 +9,7 @@ import threading
 import time
 import webbrowser
 from collections import deque
-from typing import Any, Deque, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, request
 
@@ -36,8 +36,7 @@ class AppState:
         self.mode = "accuracy"
         self.courses: List[dict] = []
         self.units: List[dict] = []
-        self.sections: List[dict] = []
-        self.sections_unit = 0
+        self.sections_map: Dict[int, List[dict]] = {}   # {单元编号: 小节列表},供小节范围校验
         self.running = False
         self.running_what = "待命"
         self.fetching = False       # 课程/单元/小节拉取进行中(与任务运行区分)
@@ -125,8 +124,7 @@ def create_app():
             state.mode = mode
             state.courses = courses
             state.units = []
-            state.sections = []
-            state.sections_unit = 0
+            state.sections_map = {}
             state.last_result = None
         state._hint("待命")
         state.log(f"共 {len(courses)} 门课程,请在课程列表中选择")
@@ -193,8 +191,7 @@ def create_app():
             state.task = None
             state.courses = []
             state.units = []
-            state.sections = []
-            state.sections_unit = 0
+            state.sections_map = {}
             state.last_result = None
         state.log("已切换模式或退出登录,请重新登录")
         return jsonify(ok=True)
@@ -232,9 +229,7 @@ def create_app():
                      "complete": "未" not in x.get("iscomplete", "未"),
                      "visible": x.get("isvisible", "true") != "false"} for x in raw]
         with state.lock:
-            state.sections = sections     # 记住编号依据,供 /api/start 校验小节范围
-            state.sections_unit = unit_index
-        state._set(False, "待命")
+            state.sections_map[unit_index] = sections   # 记住编号依据,供 /api/start 校验小节范围
         state.log(f"单元 {unit_index} 共 {len(sections)} 个小节")
         return jsonify(ok=True, sections=sections)
 
@@ -245,35 +240,36 @@ def create_app():
             return jsonify(ok=False, error="请先登录"), 400
         if not state.units:
             return jsonify(ok=False, error="请先选择课程加载单元"), 400
+        # 兼容旧字段 unit_index/section_index 与新字段 units/sections
+        raw_units = payload.get("units", payload.get("unit_index", 0))
+        raw_secs = payload.get("sections", payload.get("section_index") or None)
         try:
-            unit_index = int(payload.get("unit_index", 0))
-        except (TypeError, ValueError):
-            return jsonify(ok=False, error="单元id必须是数字(0=全部)"), 400
-        try:
-            section_index = int(payload.get("section_index", 0))
-        except (TypeError, ValueError):
-            return jsonify(ok=False, error="小节id必须是数字(0=全部)"), 400
-        if section_index < 0:
-            return jsonify(ok=False, error="小节id不能为负(0=全部)"), 400
-        if section_index > 0 and unit_index == 0:
-            return jsonify(ok=False, error="指定小节时需选择具体单元(单元id≥1)"), 400
-        with state.lock:
-            limit = len(state.sections) if (unit_index > 0
-                                            and state.sections_unit == unit_index
-                                            and state.sections) else None
-        if limit is not None and section_index > limit:
-            return jsonify(ok=False, error=f"小节id超出范围(1~{limit})"), 400
+            all_units, unit_list, section_map = welearn_common.normalize_targets(raw_units, raw_secs)
+        except (TypeError, ValueError) as e:
+            return jsonify(ok=False, error=str(e)), 400
+        if section_map:
+            with state.lock:
+                known_map = dict(state.sections_map)
+            for uno, secs in section_map.items():
+                known = known_map.get(uno)
+                if known and max(secs) > len(known):
+                    return jsonify(ok=False,
+                                   error=f"单元{uno}小节id超出范围(1~{len(known)})"), 400
         try:
             param = welearn_common.parse_numeric_param(str(payload.get("param", "")))
         except ValueError as e:
             return jsonify(ok=False, error=f"参数格式错误:{e}\n模式1: 100   模式2: 70,100"), 400
+        desc = "全部单元" if all_units else "单元" + ",".join(str(u) for u in unit_list)
+        if section_map:
+            desc += " 小节" + ",".join(
+                f"{u}:[{'/'.join(str(s) for s in secs)}]" for u, secs in section_map.items())
         state.stop_event.clear()
         state._set(True, "任务运行中")
-        state.log(f"开始任务:单元id={unit_index} 小节id={section_index} 参数={param}")
+        state.log(f"开始任务:{desc} 参数={param}")
 
         def work():
             try:
-                result = state.task.run(unit_index, param, section_index)
+                result = state.task.run(0 if all_units else unit_list, param, section_map)
             except Exception as e:
                 msg = repr(e)   # except 块结束会自动删除 e,先取值再使用
                 state._set(False, "待命")
@@ -332,9 +328,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
   button { padding: 4px 18px; margin-right: 6px; }
   #log { height: 320px; overflow-y: scroll; background: #111; color: #0f0;
          padding: 8px; border-radius: 6px; white-space: pre-wrap; font-size: 13px; }
-  #sections { max-height: 220px; overflow-y: auto; background: #fff; border: 1px solid #ccc;
+  #unitTree { max-height: 360px; overflow-y: auto; background: #fff; border: 1px solid #ccc;
               padding: 4px 8px; font-size: 13px; margin-top: 4px; }
-  #sections div { padding: 1px 0; }
+  .unit-row { margin: 3px 0; }
+  .unit-row > label { font-weight: bold; display: block; }
+  .sec-box { margin-left: 30px; margin-top: 2px; }
+  .sec-row { display: block; font-weight: normal; }
   .sec-done { color: #0a7d25; }
   .sec-todo { color: #b00; }
   .sec-hidden { color: #999; }
@@ -366,21 +365,19 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <select id="courseSel"><option value="">-- 请先登录 --</option></select>
   <button id="refreshBtn">刷新课程</button>
 </div>
+</fieldset>
+
+<fieldset>
+<legend>单元与小节(勾选要刷的单元;勾选单元后展开小节,勾选小节=只刷勾选的,不勾=刷整个单元)</legend>
 <div class="row">
-  单元:
-  <select id="unitSel"><option value="">-- 请先选择课程 --</option></select>
+  <label><input type="checkbox" id="allUnits"> 全部单元(忽略下方勾选)</label>
 </div>
-<div class="row">
-  单元小节(选中具体单元后自动加载,只读):
-  <div id="sections"></div>
-</div>
+<div id="unitTree"></div>
 </fieldset>
 
 <fieldset>
 <legend>任务参数</legend>
 <div class="row">
-  单元id(0=全部):<input type="text" id="unitIndex" value="0" size="4">
-  小节id(0=全部):<input type="text" id="sectionIndex" value="0" size="4">
   <span id="paramLabel">正确率(100 或 70,100):</span>
   <input type="text" id="param" size="12">
 </div>
@@ -442,50 +439,157 @@ function fillCourses(list, keepSelection) {
   }
 }
 
-function renderSections(sections) {
-  var box = $('sections');
-  box.innerHTML = '';
-  if (!sections) {
+function renderTree(units) {
+  var tree = $('unitTree');
+  tree.innerHTML = '';
+  var list = units || [];
+  if (!list.length) {
     var hint = document.createElement('div');
     hint.className = 'dim';
-    hint.textContent = '-- 选中具体单元后显示其小节 --';
-    box.appendChild(hint);
+    hint.textContent = '-- 请先选择课程加载单元 --';
+    tree.appendChild(hint);
+    return;
+  }
+  for (var i = 0; i < list.length; i++) {
+    var u = list[i];
+    var no = i + 1;
+    var visible = String(u.visible || 'true').toLowerCase() === 'true';
+    var row = document.createElement('div');
+    row.className = 'unit-row';
+    var label = document.createElement('label');
+    if (!visible) label.className = 'sec-hidden';   // 未开放单元灰显,仍可勾(其小节会被跳过)
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'unit-cb';
+    cb.dataset.no = String(no);
+    cb.addEventListener('change', function () { onUnitToggled(this); });
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(
+      ' [NO.' + no + '] ' + (visible ? '[已开放] ' : '![未开放]! ') + u.unitname + '  ' + u.name));
+    var secBox = document.createElement('div');
+    secBox.className = 'sec-box';
+    secBox.dataset.no = String(no);
+    secBox.style.display = 'none';
+    row.appendChild(label);
+    row.appendChild(secBox);
+    tree.appendChild(row);
+  }
+}
+
+function renderSecs(no, sections) {
+  var box = document.querySelector('.sec-box[data-no="' + no + '"]');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!sections || !sections.length) {
+    var d = document.createElement('div');
+    d.className = 'dim';
+    d.textContent = '-- 该单元无小节数据 --';
+    box.appendChild(d);
     return;
   }
   for (var i = 0; i < sections.length; i++) {
     var s = sections[i];
-    var line = document.createElement('div');
-    var no = (i + 1) + '. ';   // 编号即小节id,对应任务参数"小节id(0=全部)"
-    if (!s.visible) {
-      line.className = 'sec-hidden';
-      line.textContent = no + '[未开放] ' + s.location;
-    } else if (s.complete) {
-      line.className = 'sec-done';
-      line.textContent = no + '[已完成] ' + s.location;
-    } else {
-      line.className = 'sec-todo';
-      line.textContent = no + '[未完成] ' + s.location;
-    }
-    box.appendChild(line);
+    var secNo = i + 1;   // 编号即小节参数依据
+    var label = document.createElement('label');
+    label.className = 'sec-row ' + (!s.visible ? 'sec-hidden'
+                                     : (s.complete ? 'sec-done' : 'sec-todo'));
+    var cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'sec-cb';
+    cb.dataset.no = String(no);
+    cb.dataset.sec = String(secNo);
+    if (!s.visible) { cb.disabled = true; cb.dataset.baseDisabled = '1'; }   // 未开放小节不可刷
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(
+      ' ' + secNo + '. ' + (!s.visible ? '[未开放] ' : (s.complete ? '[已完成] ' : '[未完成] '))
+      + s.location));
+    box.appendChild(label);
   }
 }
 
-function fillUnits(list) {
-  renderSections(null);   // 单元列表重建时小节展示同步清空
-  var sel = $('unitSel');
-  sel.innerHTML = '';
-  var units = list || [];
-  if (!units.length) {
-    sel.appendChild(new Option('-- 请先选择课程 --', ''));
-    return;
+/* 勾选单元时懒加载其小节;done 回调用于恢复勾选场景(加载完成后再打勾) */
+function ensureSecs(no, done) {
+  var box = document.querySelector('.sec-box[data-no="' + no + '"]');
+  if (!box) { if (done) done(); return; }
+  if (box.childNodes.length) { if (done) done(); return; }   // 已加载(或加载中)不重复请求
+  var loading = document.createElement('div');
+  loading.className = 'dim';
+  loading.textContent = '-- 小节加载中... --';
+  box.appendChild(loading);
+  apiPost('/api/sections', {unit_index: no})
+    .then(function (j) {
+      if (!j.ok) { box.innerHTML = ''; appendLocal('加载小节失败:' + j.error); return; }
+      renderSecs(no, j.sections);
+      applyAllUnits();
+      if (done) done();
+    })
+    .catch(function (err) { box.innerHTML = ''; appendLocal('请求失败:' + err); });
+}
+
+function onUnitToggled(cb) {
+  var box = document.querySelector('.sec-box[data-no="' + cb.dataset.no + '"]');
+  if (!box) return;
+  if (cb.checked) {
+    box.style.display = '';
+    ensureSecs(Number(cb.dataset.no));
+  } else {
+    box.style.display = 'none';
   }
-  sel.appendChild(new Option('[NO. 0] 按顺序刷全部单元', '0'));
-  for (var i = 0; i < units.length; i++) {
-    var u = units[i];
-    var visible = String(u.visible || 'true').toLowerCase() === 'true';
-    sel.appendChild(new Option('[NO.' + (i + 1) + '] ' + (visible ? '[已开放] ' : '![未开放]! ')
-                               + u.unitname + '  ' + u.name, String(i + 1)));
-  }
+}
+
+function applyAllUnits() {
+  var on = $('allUnits').checked;
+  document.querySelectorAll('.unit-cb').forEach(function (cb) { cb.disabled = on; });
+  document.querySelectorAll('.sec-cb').forEach(function (sc) {
+    sc.disabled = on || sc.dataset.baseDisabled === '1';
+  });
+  $('unitTree').style.opacity = on ? '0.5' : '';
+}
+
+function resetTree() {
+  $('allUnits').checked = false;
+  applyAllUnits();
+  renderTree([]);
+}
+
+/* 从界面收集任务目标:{allUnits, units:[编号], sections:{编号:[小节编号]}} */
+function buildSelection() {
+  var sel = {allUnits: $('allUnits').checked, units: [], sections: {}};
+  if (sel.allUnits) return sel;
+  var byNo = {};
+  document.querySelectorAll('.unit-cb').forEach(function (cb) {
+    if (cb.checked) { byNo[cb.dataset.no] = true; sel.units.push(Number(cb.dataset.no)); }
+  });
+  document.querySelectorAll('.sec-cb').forEach(function (sc) {
+    if (!sc.checked || sc.disabled) return;
+    if (!byNo[sc.dataset.no]) return;   // 单元未勾选时其小节勾选无效
+    if (!sel.sections[sc.dataset.no]) sel.sections[sc.dataset.no] = [];
+    sel.sections[sc.dataset.no].push(Number(sc.dataset.sec));
+  });
+  return sel;
+}
+
+/* 刷新/重登后恢复勾选:单元直接打勾,小节需重新拉取后再打勾 */
+function restoreSelection(sel) {
+  if (!sel) return;
+  $('allUnits').checked = !!sel.allUnits;
+  applyAllUnits();
+  var want = {};
+  (sel.units || []).forEach(function (no) { want[no] = true; });
+  document.querySelectorAll('.unit-cb').forEach(function (cb) {
+    cb.checked = !!want[cb.dataset.no];
+    if (cb.checked) onUnitToggled(cb);
+  });
+  var secs = sel.sections || {};
+  Object.keys(secs).forEach(function (noStr) {
+    var cb = document.querySelector('.unit-cb[data-no="' + noStr + '"]');
+    if (!cb || !cb.checked) return;
+    ensureSecs(Number(noStr), function () {
+      document.querySelectorAll('.sec-cb[data-no="' + noStr + '"]').forEach(function (sc) {
+        sc.checked = secs[noStr].indexOf(Number(sc.dataset.sec)) >= 0;
+      });
+    });
+  });
 }
 
 function appendLogs(entries) {
@@ -510,40 +614,19 @@ function appendLocal(text) {
   box.scrollTop = box.scrollHeight;
 }
 
-function loadSections(unitIndex) {
-  apiPost('/api/sections', {unit_index: unitIndex})
-    .then(function (j) {
-      if (!j.ok) { renderSections(null); appendLocal('加载小节失败:' + j.error); return; }
-      renderSections(j.sections);
-    })
-    .catch(function (err) { renderSections(null); appendLocal('请求失败:' + err); });
-}
-
-function restoreUnitSelection(prev) {
-  var sel = $('unitSel');
-  if (!prev) return;
-  for (var i = 0; i < sel.options.length; i++) {
-    if (sel.options[i].value === prev) { sel.value = prev; break; }
-  }
-  if (sel.value === prev) {
-    $('unitIndex').value = prev;
-    if (prev !== '0') loadSections(Number(prev));
-  }
-}
-
-/* 刷新课程(保留选择);若已选课程则连单元一起刷新并恢复单元/小节选择 */
+/* 刷新课程(保留选择);若已选课程则连单元一起刷新并恢复单元/小节勾选 */
 function refreshAll(kind) {
+  var prevSel = buildSelection();
   apiPost('/api/refresh', {})
     .then(function (j) {
       if (!j.ok) { if (kind === 'manual') alert('刷新失败\n' + j.error); return; }
       fillCourses(j.courses, true);
-      if (!$('courseSel').value) { fillUnits([]); return; }
-      var prevUnit = $('unitSel').value;
+      if (!$('courseSel').value) { renderTree([]); return; }
       apiPost('/api/units', {cid: Number($('courseSel').value)})
         .then(function (j2) {
-          if (!j2.ok) { fillUnits([]); return; }
-          fillUnits(j2.units);
-          restoreUnitSelection(prevUnit);
+          if (!j2.ok) { renderTree([]); return; }
+          renderTree(j2.units);
+          restoreSelection(prevSel);
         })
         .catch(function () {});
     })
@@ -555,7 +638,7 @@ function refreshAll(kind) {
 document.querySelectorAll('input[name=mode]').forEach(function (radio) {
   radio.addEventListener('change', function () {
     fillCourses([]);
-    fillUnits([]);
+    resetTree();
     window.__hasTask = false;
     setControls(false);
     $('paramLabel').textContent = getMode() === 'time'
@@ -570,31 +653,32 @@ $('loginBtn').addEventListener('click', function () {
   var password = $('password').value;
   if (!username || !password) { alert('请输入账号和密码'); return; }
   var prevCourse = $('courseSel').value;
-  var prevUnit = $('unitSel').value;
+  var prevSel = buildSelection();
   apiPost('/api/login', {username: username, password: password, mode: getMode()})
     .then(function (j) {
       if (!j.ok) { alert('登录失败\n' + j.error); return; }
       window.__hasTask = true;
       fillCourses(j.courses, true);
-      if (prevCourse && $('courseSel').value === prevCourse && prevUnit) {
-        /* 重新登录且课程未变:自动恢复单元与小节,无需重选 */
+      if (prevCourse && $('courseSel').value === prevCourse
+          && (prevSel.units.length || prevSel.allUnits)) {
+        /* 重新登录且课程未变:自动恢复单元与小节勾选,无需重选 */
         apiPost('/api/units', {cid: Number(prevCourse)})
           .then(function (j2) {
-            if (!j2.ok) { fillUnits([]); return; }
-            fillUnits(j2.units);
-            restoreUnitSelection(prevUnit);
+            if (!j2.ok) { renderTree([]); return; }
+            renderTree(j2.units);
+            restoreSelection(prevSel);
           })
-          .catch(function () { fillUnits([]); });
+          .catch(function () { renderTree([]); });
       } else {
         /* 首次登录:下拉默认高亮第一门课,但浏览器不会再触发 change——
            必须主动加载其单元,否则"看起来选了课却没有单元" */
         var firstCid = $('courseSel').value;
         if (firstCid) {
           apiPost('/api/units', {cid: Number(firstCid)})
-            .then(function (j2) { fillUnits(j2.ok ? j2.units : []); })
-            .catch(function () { fillUnits([]); });
+            .then(function (j2) { renderTree(j2.ok ? j2.units : []); })
+            .catch(function () { renderTree([]); });
         } else {
-          fillUnits([]);
+          renderTree([]);
         }
       }
       setControls(false);
@@ -611,30 +695,24 @@ $('courseSel').addEventListener('change', function () {
   if (!cid) return;
   apiPost('/api/units', {cid: Number(cid)})
     .then(function (j) {
-      if (!j.ok) { alert('加载单元失败\n' + j.error); return; }
-      fillUnits(j.units);
+      if (!j.ok) { alert('加载单元失败\n' + j.error); renderTree([]); return; }
+      renderTree(j.units);
     })
     .catch(function (err) { alert('请求失败:' + err); });
 });
 
-$('unitSel').addEventListener('change', function () {
-  var v = $('unitSel').value;
-  if (v !== '') $('unitIndex').value = v;
-  $('sectionIndex').value = '0';   // 编号随单元重置,防止旧小节id误用
-  if (v && v !== '0') {
-    loadSections(Number(v));
-  } else {
-    renderSections(null);
-  }
-});
+$('allUnits').addEventListener('change', applyAllUnits);
 
 $('startBtn').addEventListener('click', function () {
-  var unitIndex = parseInt($('unitIndex').value, 10);
-  if (isNaN(unitIndex) || unitIndex < 0) { alert('单元id必须是数字(0=全部)'); return; }
-  var sectionIndex = parseInt($('sectionIndex').value, 10);
-  if (isNaN(sectionIndex) || sectionIndex < 0) { alert('小节id必须是数字(0=全部)'); return; }
-  if (sectionIndex > 0 && unitIndex === 0) { alert('指定小节时需先选择具体单元(单元id≥1)'); return; }
-  apiPost('/api/start', {unit_index: unitIndex, section_index: sectionIndex, param: $('param').value})
+  var sel = buildSelection();
+  if (!sel.allUnits && !sel.units.length) {
+    alert('请至少勾选一个单元,或勾选"全部单元"');
+    return;
+  }
+  var body = {units: sel.allUnits ? 0 : sel.units,
+              sections: sel.allUnits ? null : sel.sections,
+              param: $('param').value};
+  apiPost('/api/start', body)
     .then(function (j) {
       if (!j.ok) { alert(j.error); return; }
       setControls(true);
@@ -667,7 +745,7 @@ function poll() {
     .catch(function () { /* 服务未就绪或已关闭,下轮重试 */ });
 }
 
-renderSections(null);
+renderTree([]);
 poll();
 setInterval(poll, 1000);
 </script>

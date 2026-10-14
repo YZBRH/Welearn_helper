@@ -58,42 +58,38 @@ class AccuracyTask:
         return welearn_common.fetch_sections(self.session, self.cid, self.uid,
                                              unit_index - 1, self.classid)
 
-    def run(self, unit_index: int, param, section_index: int = 0) -> Dict[str, Any]:
-        if unit_index == 0 and section_index:
-            raise ValueError("指定小节时请选择具体单元(单元id≥1)")
+    def run(self, units, param, sections=None) -> Dict[str, Any]:
+        """units: 0=全部单元(沿用原版错误驱动推进), [n,...]=指定单元;
+        sections: None=整单元, {单元编号: [小节编号]}=只刷勾选小节。"""
+        all_units, unit_list, section_map = welearn_common.normalize_targets(units, sections)
         random_mode = isinstance(param, tuple)
         way1_succeed, way2_succeed = 0, 0
         way1_failed, way2_failed = 0, 0
-        section_matched = not section_index   # 是否命中过指定小节(用于越界提示)
+        sections_found = 0   # 实际命中的指定小节数(用于越界提示)
 
         info_headers = {
             "Referer": f"https://welearn.sflep.com/2019/student/course_info.aspx?cid={self.cid}",
         }
 
-        if unit_index == 0:
-            unit = 0
-            advance_until_error = True   # 原版语义:持续探测下一单元,直到服务器报错才终止
-        else:
-            unit = unit_index - 1
-            advance_until_error = False
-
-        while True:
-            if self._stopped():
-                break
+        def process_unit(unit_idx: int, uno: int) -> bool:
+            """拉取并处理一个单元(unitidx 为 0-based 接口参数,uno 为 1-based 展示编号);
+            返回 False 表示服务器报错(单元不存在/已到末尾)。"""
+            nonlocal way1_succeed, way2_succeed, way1_failed, way2_failed, sections_found
             response = self.session.get(
-                f'https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves&cid={self.cid}&uid={self.uid}&unitidx={unit}&classid={self.classid}',
+                f'https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves&cid={self.cid}&uid={self.uid}&unitidx={unit_idx}&classid={self.classid}',
                 headers=info_headers)
 
             if "异常" in response.text or "出错了" in response.text:
-                break
+                return False
 
+            wanted = section_map.get(uno) if section_map else None
             for no, course in enumerate(response.json()["info"], start=1):
                 if self._stopped():
                     break
-                if section_index and no != section_index:
-                    continue   # 指定小节模式:只刷编号等于 section_index 的小节
-                if section_index:
-                    section_matched = True
+                if wanted and no not in wanted:
+                    continue   # 指定小节模式:只刷勾选的小节
+                if wanted:
+                    sections_found += 1
                 if course['isvisible'] == 'false':  # 跳过未开放课程
                     self.on_log(f'[!!跳过!!]    {course["location"]}')
                 elif "未" in course["iscomplete"]:  # 章节未完成
@@ -145,13 +141,28 @@ class AccuracyTask:
                                 f'方式2:{"成功!!!" if way2_ok else "失败!!!"}')
                 else:  # 章节已完成
                     self.on_log(f'[ 已完成 ]    {course["location"]}')
+            return True
 
-            if not advance_until_error:
-                break
-            unit += 1
+        if all_units:
+            unit = 0
+            advance_until_error = True   # 原版语义:持续探测下一单元,直到服务器报错才终止
+            while True:
+                if self._stopped():
+                    break
+                if not process_unit(unit, unit + 1):
+                    break
+                if not advance_until_error:
+                    break
+                unit += 1
+        else:
+            for uno in unit_list:
+                if self._stopped():
+                    break
+                if not process_unit(uno - 1, uno):
+                    self.on_log(f"[!] 单元 {uno} 不可用,已跳过")
 
-        if section_index and not section_matched:
-            self.on_log(f"[!] 未找到第 {section_index} 小节(超出该单元小节编号)")
+        if section_map and sections_found == 0:
+            self.on_log("[!] 未找到任何指定小节(编号超出所选单元的小节范围)")
 
         return {'way1_succeed': way1_succeed, 'way1_failed': way1_failed,
                 'way2_succeed': way2_succeed, 'way2_failed': way2_failed}

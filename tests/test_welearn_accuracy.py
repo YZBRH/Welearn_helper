@@ -104,7 +104,7 @@ class TestSectionFilter:
             {"id": 3, "location": "L3", "isvisible": "true", "iscomplete": "未完成"},
         ]
         task = make_task(fake, chapters)
-        result = task.run(1, 100, section_index=2)   # 只刷第2小节
+        result = task.run(1, 100, sections=2)   # 只刷第2小节
         assert result["way1_succeed"] == 1
         sco_posts = [r for r in fake.requests if r[1] == "https://welearn.sflep.com/Ajax/SCO.aspx"]
         assert len(sco_posts) == 3   # 仅第2小节: startsco+setsco+savesco
@@ -121,14 +121,62 @@ class TestSectionFilter:
         fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
             FakeResponse(json_data={"info": [{"id": 1, "location": "L1",
                                               "isvisible": "true", "iscomplete": "未完成"}]})
-        result = task.run(1, 100, section_index=9)
+        result = task.run(1, 100, sections=9)
         assert result["way1_succeed"] == 0
         sco_posts = [r for r in fake.requests if r[1] == "https://welearn.sflep.com/Ajax/SCO.aspx"]
         assert len(sco_posts) == 0
-        assert any("未找到第 9 小节" in m for m in logs)
+        assert any("未找到任何指定小节" in m for m in logs)
 
     def test_section_with_all_units_rejected(self):
         import pytest
         task = welearn_accuracy.AccuracyTask("u", "p", on_log=lambda m: None)
         with pytest.raises(ValueError):
-            task.run(0, 100, section_index=1)
+            task.run(0, 100, sections=1)
+
+
+class TestMultiSelect:
+    def test_multiple_units_all_processed(self):
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = FakeResponse(text='{"ret":0}')
+
+        def scoleaves(url, data):
+            if "unitidx=0" in url or "unitidx=2" in url:
+                return FakeResponse(json_data={"info": [
+                    {"id": 1, "location": "L", "isvisible": "true", "iscomplete": "未完成"}]})
+            return FakeResponse(text="出错了")
+
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = scoleaves
+        task = welearn_accuracy.AccuracyTask("u", "p", on_log=lambda m: None)
+        task.session = fake
+        task.cid, task.uid, task.classid = "C1", "U1", "K1"
+        task.units = [{}] * 3
+        result = task.run([1, 3], 100)
+        urls = [r[1] for r in fake.requests if "scoLeaves" in r[1]]
+        assert any("unitidx=0" in u for u in urls) and any("unitidx=2" in u for u in urls)
+        assert result["way1_succeed"] == 2   # 两个单元各刷 1 小节
+        assert not any("unitidx=1" in u for u in urls), "未选中的单元不应请求"
+
+    def test_multi_sections_within_unit(self):
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = FakeResponse(text='{"ret":0}')
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
+            FakeResponse(json_data={"info": [
+                {"id": 1, "location": "L1", "isvisible": "true", "iscomplete": "未完成"},
+                {"id": 2, "location": "L2", "isvisible": "true", "iscomplete": "未完成"},
+                {"id": 3, "location": "L3", "isvisible": "true", "iscomplete": "未完成"},
+                {"id": 4, "location": "L4", "isvisible": "true", "iscomplete": "未完成"}]})
+        task = welearn_accuracy.AccuracyTask("u", "p", on_log=lambda m: None)
+        task.session = fake
+        task.cid, task.uid, task.classid = "C1", "U1", "K1"
+        task.units = [{}]
+        result = task.run([1], 100, sections={1: [1, 3]})
+        assert result["way1_succeed"] == 2
+        scoids = {r[2]["scoid"] for r in fake.requests
+                  if r[1] == "https://welearn.sflep.com/Ajax/SCO.aspx" and r[2]["action"] == "startsco160928"}
+        assert scoids == {1, 3}
+
+    def test_empty_unit_list_rejected(self):
+        import pytest
+        task = welearn_accuracy.AccuracyTask("u", "p", on_log=lambda m: None)
+        with pytest.raises(ValueError):
+            task.run([], 100)

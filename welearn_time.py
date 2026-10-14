@@ -65,28 +65,27 @@ class TimeTask:
             return target_time
         return random.randint(target_time[0], target_time[1])
 
-    def run(self, unit_index: int, param, section_index: int = 0) -> Dict[str, Any]:
-        if unit_index == 0 and section_index:
-            raise ValueError("指定小节时请选择具体单元(单元id≥1)")
+    def run(self, units, param, sections=None) -> Dict[str, Any]:
+        """units: 0=全部单元, [n,...]=指定单元; sections: None=整单元,
+        {单元编号: [小节编号]}=只刷勾选小节。"""
+        all_units, unit_list, section_map = welearn_common.normalize_targets(units, sections)
         target_time = param
         errors: List[str] = []
         max_learning_time = 0
 
-        if unit_index == 0:
-            start_index, end_index = 0, len(self.units)
-        else:
-            start_index, end_index = unit_index - 1, unit_index
+        indices = range(0, len(self.units)) if all_units else [u - 1 for u in unit_list]
 
         pending: List[Tuple[int, dict]] = []
-        for unit in range(start_index, end_index):
+        for unit in indices:
             if self._stopped():
                 break
             response = self.session.get(
                 f"https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves&cid={self.cid}&uid={self.uid}&unitidx={str(unit)}&classid={self.classid}",
                 headers={'Referer': 'https://welearn.sflep.com/2019/student/course_info.aspx?cid=' + self.cid})
+            wanted = section_map.get(unit + 1) if section_map else None
             for no, chapter in enumerate(response.json()['info'], start=1):
-                if section_index and no != section_index:
-                    continue   # 指定小节模式:只刷编号等于 section_index 的小节
+                if wanted and no not in wanted:
+                    continue   # 指定小节模式:只刷勾选的小节
                 learning_time = self._generate_learning_time(target_time)
                 if learning_time > max_learning_time:
                     max_learning_time = learning_time

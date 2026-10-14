@@ -86,7 +86,7 @@ class TestSectionFilter:
                     {"id": 2, "location": "B", "learntime": 0},
                     {"id": 3, "location": "C", "learntime": 0}]
         task = make_task(fake, chapters)
-        result = task.run(1, 1, section_index=3)
+        result = task.run(1, 1, sections=3)
         assert result["total"] == 1
         assert result["succeed"] == 1
         save_posts = [r for r in fake.requests
@@ -98,4 +98,26 @@ class TestSectionFilter:
         import pytest
         task = welearn_time.TimeTask("u", "p", on_log=lambda m: None)
         with pytest.raises(ValueError):
-            task.run(0, 30, section_index=1)
+            task.run(0, 30, sections=1)
+
+
+class TestMultiSelect:
+    def test_multi_units_multi_sections(self):
+        fake = FakeSession()
+
+        def scoleaves(url, data):
+            unitidx = int(url.split("unitidx=")[1].split("&")[0])
+            info = [{"id": 100 + unitidx, "location": "A", "learntime": 0},
+                    {"id": 200 + unitidx, "location": "B", "learntime": 0}]
+            return FakeResponse(json_data={"info": info})
+
+        task = make_task(fake, [])   # 先建任务,再用可调用路由覆盖其静态路由
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = scoleaves
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = ok_ajax_response()
+        task.units = [{}] * 3
+        result = task.run([2, 3], 1, sections={2: [1], 3: [2]})
+        # 单元2(unitidx=1)取第1小节(id=101),单元3(unitidx=2)取第2小节(id=202)
+        assert result["total"] == 2
+        saved = [r[2]["scoid"] for r in fake.requests
+                 if r[2] and r[2].get("action") == "savescoinfo160928"]
+        assert sorted(saved) == [101, 202]

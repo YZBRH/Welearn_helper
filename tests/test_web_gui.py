@@ -33,10 +33,10 @@ class FakeTask:
         return [{"location": "U1 > A", "iscomplete": "completed", "isvisible": "true"},
                 {"location": "U1 > B", "iscomplete": "未完成", "isvisible": "false"}]
 
-    def run(self, unit_index, param, section_index=0):
-        self.last_run_args = (unit_index, param, section_index)
+    def run(self, units, param, sections=None):
+        self.last_run_args = (units, param, sections)
         time.sleep(0.2)   # 让"任务运行中"状态可被观测,避免与断言竞态
-        self.on_log(f"fake run unit={unit_index} param={param} section={section_index}")
+        self.on_log(f"fake run units={units} param={param} sections={sections}")
         return {"way1_succeed": 1, "way1_failed": 0,
                 "way2_succeed": 1, "way2_failed": 0}
 
@@ -215,7 +215,7 @@ class TestStartSection:
                                        "section_index": 2}).get_json()
         assert j["ok"] is True
         state.worker.join(timeout=5)
-        assert FakeTask.instances[-1].last_run_args == (1, 100, 2)
+        assert FakeTask.instances[-1].last_run_args == ([1], 100, {1: [2]})
 
     def test_section_with_all_units_rejected(self, client):
         c, _ = client
@@ -254,10 +254,9 @@ class TestRefreshAfterTaskEnd:
         login(client)
         c.post("/api/units", json={"cid": 11})
         c.post("/api/sections", json={"unit_index": 1})
-        assert state.units and state.sections
+        assert state.units and state.sections_map
         login(client)
-        assert state.units == [] and state.sections == []
-        assert state.sections_unit == 0
+        assert state.units == [] and state.sections_map == {}
 
     def test_start_rejected_while_fetch_in_flight(self, client):
         """单元/课程拉取进行中(fetching)时不得开任务,避免并发用同一会话"""
@@ -267,6 +266,44 @@ class TestRefreshAfterTaskEnd:
         state.fetching = True   # 模拟一次拉取正在进行
         r = c.post("/api/start", json={"unit_index": 1, "param": "100"})
         assert r.status_code == 409
+
+
+class TestMultiSelectStart:
+    def test_units_list_and_sections_map_passed(self, client):
+        c, state = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        j = c.post("/api/start", json={"units": [3, 1], "param": "100",
+                                       "sections": {"3": [2, 5]}}).get_json()
+        assert j["ok"] is True
+        state.worker.join(timeout=5)
+        assert FakeTask.instances[-1].last_run_args == ([1, 3], 100, {3: [2, 5]})
+
+    def test_empty_units_rejected(self, client):
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        r = c.post("/api/start", json={"units": [], "param": "100"})
+        assert r.status_code == 400
+        assert "未选择任何单元" in r.get_json()["error"]
+
+    def test_all_units_with_sections_rejected(self, client):
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        r = c.post("/api/start", json={"units": 0, "param": "100",
+                                       "sections": {"1": [1]}})
+        assert r.status_code == 400
+
+    def test_sections_over_known_range_rejected_per_unit(self, client):
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        c.post("/api/sections", json={"unit_index": 1})   # 2 个小节
+        r = c.post("/api/start", json={"units": [1], "param": "100",
+                                       "sections": {"1": [99]}})
+        assert r.status_code == 400
+        assert "1~2" in r.get_json()["error"]
 
 
 class TestStatusLogs:

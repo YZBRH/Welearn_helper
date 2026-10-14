@@ -3,7 +3,7 @@ import base64
 import re
 import threading
 import time
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import tls_client
 
@@ -149,6 +149,61 @@ def fetch_units(session, cid: str, uid: str) -> List[dict]:
         params={'action': 'courseunits', 'cid': cid, 'uid': uid},
         headers={'Referer': 'https://welearn.sflep.com/2019/student/course_info.aspx'})
     return response.json()['info']
+
+
+def normalize_targets(units, sections=None) -> Tuple[bool, Optional[List[int]], Optional[Dict[int, List[int]]]]:
+    """解析任务目标为 (是否全部单元, 单元编号列表, {单元编号: [小节编号]})。
+
+    units:   0/None=全部单元; 正整数=单个单元; 非空列表=多个单元
+    sections: None/{}=整单元; 正整数=该单元单个小节; {单元编号: [小节编号]}=按单元多选
+    非法输入抛 ValueError(界面直接展示给用户)。
+    """
+    all_units = units in (0, None)
+    if all_units:
+        unit_list = None
+    elif isinstance(units, int):
+        if units < 1:
+            raise ValueError("单元编号从1开始")
+        unit_list = [units]
+    else:
+        try:
+            unit_list = sorted({int(u) for u in units})
+        except (TypeError, ValueError):
+            raise ValueError("单元编号格式错误")
+        if not unit_list:
+            raise ValueError("未选择任何单元(勾选单元或选择全部单元)")
+        if unit_list[0] < 1:
+            raise ValueError("单元编号从1开始")
+
+    if sections in (None, {}, 0):
+        return all_units, unit_list, None
+    if all_units:
+        raise ValueError("指定小节时请选择具体单元(不能与全部单元同用)")
+
+    if isinstance(sections, dict):
+        section_map: Dict[int, List[int]] = {}
+        for u, secs in sections.items():
+            try:
+                uno, sec_list = int(u), [int(s) for s in secs]
+            except (TypeError, ValueError):
+                raise ValueError("小节编号格式错误")
+            sec_list = sorted(set(sec_list))
+            if sec_list and sec_list[0] < 1:
+                raise ValueError("小节编号从1开始")
+            if sec_list:
+                section_map[uno] = sec_list
+    else:
+        try:
+            sec = int(sections)
+        except (TypeError, ValueError):
+            raise ValueError("小节编号格式错误")
+        if sec < 1:
+            raise ValueError("小节编号从1开始")
+        section_map = {u: [sec] for u in unit_list or []}
+
+    if not section_map:
+        return all_units, unit_list, None
+    return all_units, unit_list, section_map
 
 
 def fetch_sections(session, cid: str, uid: str, unitidx: int, classid: str) -> List[dict]:
