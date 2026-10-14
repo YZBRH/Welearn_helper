@@ -155,6 +155,20 @@ class TestPageJs:
         assert "alert('登录失败\\n'" in body   # 必须是字面量 反斜杠+n
 
 
+class TestQuietStatusPoll:
+    def test_status_poll_lines_hidden_others_kept(self):
+        """/api/status 每秒轮询会刷屏控制台,需隐藏;其余访问行保留"""
+        import logging
+        f = web_gui._QuietStatusPoll()
+
+        def mk(msg):
+            return logging.LogRecord("werkzeug", logging.INFO, "p", 1, msg, None, None)
+
+        assert f.filter(mk('127.0.0.1 - - "GET /api/status?after=6 HTTP/1.1" 200 -')) is False
+        assert f.filter(mk('127.0.0.1 - - "GET / HTTP/1.1" 200 -')) is True
+        assert f.filter(mk('127.0.0.1 - - "POST /api/login HTTP/1.1" 200 -')) is True
+
+
 class TestStatusLogs:
     def test_incremental_logs_after_seq(self, client):
         c, state = client

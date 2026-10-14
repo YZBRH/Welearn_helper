@@ -3,6 +3,7 @@
 启动: py -u web_gui.py  →  自动打开浏览器 http://127.0.0.1:17777/
 环境变量 WELEARN_NO_OPEN=1 跳过自动开浏览器(冒烟/测试用)。
 """
+import logging
 import os
 import threading
 import time
@@ -482,7 +483,15 @@ setInterval(poll, 1000);
 """
 
 
+class _QuietStatusPoll(logging.Filter):
+    """控制台隐藏 /api/status 轮询访问行(每秒一条会刷屏),其余访问行保留"""
+
+    def filter(self, record):
+        return "/api/status" not in record.getMessage()
+
+
 def main():
+    logging.getLogger("werkzeug").addFilter(_QuietStatusPoll())
     port = int(os.environ.get("WELEARN_PORT", "17777"))
     url = f"http://127.0.0.1:{port}/"
     print(BANNER)
