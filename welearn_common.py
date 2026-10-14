@@ -149,3 +149,13 @@ def fetch_units(session, cid: str, uid: str) -> List[dict]:
         params={'action': 'courseunits', 'cid': cid, 'uid': uid},
         headers={'Referer': 'https://welearn.sflep.com/2019/student/course_info.aspx'})
     return response.json()['info']
+
+
+def fetch_sections(session, cid: str, uid: str, unitidx: int, classid: str) -> List[dict]:
+    """只读拉取指定单元的小节列表(scoLeaves,与刷课遍历同一接口;不提交任何数据)"""
+    response = session.get(
+        f'https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves&cid={cid}&uid={uid}&unitidx={unitidx}&classid={classid}',
+        headers={'Referer': f'https://welearn.sflep.com/2019/student/course_info.aspx?cid={cid}'})
+    if "异常" in response.text or "出错了" in response.text:
+        raise WelearnError('单元不存在或已到末尾!!!')
+    return response.json()["info"]

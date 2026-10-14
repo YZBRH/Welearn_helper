@@ -53,6 +53,11 @@ class AccuracyTask:
         self.units = welearn_common.fetch_units(self.session, self.cid, self.uid)
         return self.units
 
+    def fetch_sections(self, unit_index: int) -> List[dict]:
+        """只读获取指定单元(1-based)的小节列表,供界面展示"""
+        return welearn_common.fetch_sections(self.session, self.cid, self.uid,
+                                             unit_index - 1, self.classid)
+
     def run(self, unit_index: int, param) -> Dict[str, Any]:
         random_mode = isinstance(param, tuple)
         way1_succeed, way2_succeed = 0, 0

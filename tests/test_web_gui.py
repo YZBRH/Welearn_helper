@@ -28,6 +28,10 @@ class FakeTask:
     def fetch_units(self, cid):
         return [{"unitname": "U1", "name": "第一单元", "visible": "true"}]
 
+    def fetch_sections(self, unit_index):
+        return [{"location": "U1 > A", "iscomplete": "completed", "isvisible": "true"},
+                {"location": "U1 > B", "iscomplete": "未完成", "isvisible": "false"}]
+
     def run(self, unit_index, param):
         time.sleep(0.2)   # 让"任务运行中"状态可被观测,避免与断言竞态
         self.on_log(f"fake run unit={unit_index} param={param}")
@@ -167,6 +171,36 @@ class TestQuietStatusPoll:
         assert f.filter(mk('127.0.0.1 - - "GET /api/status?after=6 HTTP/1.1" 200 -')) is False
         assert f.filter(mk('127.0.0.1 - - "GET / HTTP/1.1" 200 -')) is True
         assert f.filter(mk('127.0.0.1 - - "POST /api/login HTTP/1.1" 200 -')) is True
+
+
+class TestSections:
+    def test_requires_login(self, client):
+        c, _ = client
+        r = c.post("/api/sections", json={"unit_index": 1})
+        assert r.status_code == 400
+
+    def test_requires_units(self, client):
+        c, _ = client
+        login(client)
+        r = c.post("/api/sections", json={"unit_index": 1})
+        assert r.status_code == 400
+
+    def test_returns_parsed_sections(self, client):
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        j = c.post("/api/sections", json={"unit_index": 1}).get_json()
+        assert j["ok"] is True
+        assert j["sections"][0] == {"location": "U1 > A", "complete": True, "visible": True}
+        assert j["sections"][1]["complete"] is False
+        assert j["sections"][1]["visible"] is False
+
+    def test_zero_and_out_of_range_rejected(self, client):
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        assert c.post("/api/sections", json={"unit_index": 0}).status_code == 400
+        assert c.post("/api/sections", json={"unit_index": 9}).status_code == 400
 
 
 class TestStatusLogs:

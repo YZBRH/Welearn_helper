@@ -182,6 +182,42 @@ def create_app():
         state.log("已切换模式或退出登录,请重新登录")
         return jsonify(ok=True)
 
+    @app.route("/api/sections", methods=["POST"])
+    def api_sections():
+        payload = request.get_json(silent=True) or {}
+        if state.task is None:
+            return jsonify(ok=False, error="请先登录"), 400
+        if not state.units:
+            return jsonify(ok=False, error="请先选择课程加载单元"), 400
+        try:
+            unit_index = int(payload.get("unit_index", 0))
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="单元序号必须是数字"), 400
+        if not 1 <= unit_index <= len(state.units):
+            return jsonify(ok=False,
+                           error=f"请选择具体单元(1~{len(state.units)});0=全部,无单独小节可显示"), 400
+        if state.worker_busy():
+            return jsonify(ok=False, error="任务正在进行,请先停止"), 409
+        state._set(True, "加载小节中...")
+        try:
+            raw = state.task.fetch_sections(unit_index)
+        except (LoginError, WelearnError) as e:
+            msg = str(e)
+            state._set(False, "待命")
+            state.log(f"加载小节失败:{msg}")
+            return jsonify(ok=False, error=msg)
+        except Exception as e:
+            msg = repr(e)
+            state._set(False, "待命")
+            state.log(f"加载小节失败:{msg}")
+            return jsonify(ok=False, error=msg)
+        sections = [{"location": x.get("location", ""),
+                     "complete": "未" not in x.get("iscomplete", "未"),
+                     "visible": x.get("isvisible", "true") != "false"} for x in raw]
+        state._set(False, "待命")
+        state.log(f"单元 {unit_index} 共 {len(sections)} 个小节")
+        return jsonify(ok=True, sections=sections)
+
     @app.route("/api/start", methods=["POST"])
     def api_start():
         payload = request.get_json(silent=True) or {}
@@ -262,6 +298,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
   button { padding: 4px 18px; margin-right: 6px; }
   #log { height: 320px; overflow-y: scroll; background: #111; color: #0f0;
          padding: 8px; border-radius: 6px; white-space: pre-wrap; font-size: 13px; }
+  #sections { max-height: 220px; overflow-y: auto; background: #fff; border: 1px solid #ccc;
+              padding: 4px 8px; font-size: 13px; margin-top: 4px; }
+  #sections div { padding: 1px 0; }
+  .sec-done { color: #0a7d25; }
+  .sec-todo { color: #b00; }
+  .sec-hidden { color: #999; }
   .status { float: right; color: #b00; font-weight: bold; }
   .dim { color: #888; }
 </style>
@@ -293,6 +335,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="row">
   单元:
   <select id="unitSel"><option value="">-- 请先选择课程 --</option></select>
+</div>
+<div class="row">
+  单元小节(选中具体单元后自动加载,只读):
+  <div id="sections"></div>
 </div>
 </fieldset>
 
@@ -355,7 +401,35 @@ function fillCourses(list) {
   }
 }
 
+function renderSections(sections) {
+  var box = $('sections');
+  box.innerHTML = '';
+  if (!sections) {
+    var hint = document.createElement('div');
+    hint.className = 'dim';
+    hint.textContent = '-- 选中具体单元后显示其小节 --';
+    box.appendChild(hint);
+    return;
+  }
+  for (var i = 0; i < sections.length; i++) {
+    var s = sections[i];
+    var line = document.createElement('div');
+    if (!s.visible) {
+      line.className = 'sec-hidden';
+      line.textContent = '[未开放] ' + s.location;
+    } else if (s.complete) {
+      line.className = 'sec-done';
+      line.textContent = '[已完成] ' + s.location;
+    } else {
+      line.className = 'sec-todo';
+      line.textContent = '[未完成] ' + s.location;
+    }
+    box.appendChild(line);
+  }
+}
+
 function fillUnits(list) {
+  renderSections(null);   // 单元列表重建时小节展示同步清空
   var sel = $('unitSel');
   sel.innerHTML = '';
   var units = list || [];
@@ -445,6 +519,16 @@ $('courseSel').addEventListener('change', function () {
 $('unitSel').addEventListener('change', function () {
   var v = $('unitSel').value;
   if (v !== '') $('unitIndex').value = v;
+  if (v && v !== '0') {
+    apiPost('/api/sections', {unit_index: Number(v)})
+      .then(function (j) {
+        if (!j.ok) { renderSections(null); appendLocal('加载小节失败:' + j.error); return; }
+        renderSections(j.sections);
+      })
+      .catch(function (err) { renderSections(null); appendLocal('请求失败:' + err); });
+  } else {
+    renderSections(null);
+  }
 });
 
 $('startBtn').addEventListener('click', function () {
@@ -475,6 +559,7 @@ function poll() {
     .catch(function () { /* 服务未就绪或已关闭,下轮重试 */ });
 }
 
+renderSections(null);
 poll();
 setInterval(poll, 1000);
 </script>

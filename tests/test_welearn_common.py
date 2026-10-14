@@ -55,3 +55,26 @@ class TestParseNumericParam:
     def test_rejects_inverted_range(self):
         with pytest.raises(ValueError):
             parse_numeric_param("30,10")
+
+
+class TestFetchSections:
+    def test_builds_url_and_parses_info(self):
+        from tests.fakes import FakeResponse, FakeSession
+        import welearn_common
+        session = FakeSession()
+        session.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
+            FakeResponse(json_data={"info": [{"location": "L1", "iscomplete": "completed"}]})
+        info = welearn_common.fetch_sections(session, "2833", "9", 2, "C1")
+        assert info[0]["location"] == "L1"
+        _method, url, _data = session.requests[0]
+        assert url == ("https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"
+                       "&cid=2833&uid=9&unitidx=2&classid=C1")
+
+    def test_server_error_text_raises(self):
+        from tests.fakes import FakeResponse, FakeSession
+        import welearn_common
+        session = FakeSession()
+        session.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
+            FakeResponse(text="出错了")
+        with pytest.raises(welearn_common.WelearnError):
+            welearn_common.fetch_sections(session, "1", "1", 99, "C")

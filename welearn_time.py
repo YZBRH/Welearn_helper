@@ -55,6 +55,11 @@ class TimeTask:
         self.units = welearn_common.fetch_units(self.session, self.cid, self.uid)
         return self.units
 
+    def fetch_sections(self, unit_index: int) -> List[dict]:
+        """只读获取指定单元(1-based)的小节列表,供界面展示"""
+        return welearn_common.fetch_sections(self.session, self.cid, self.uid,
+                                             unit_index - 1, self.classid)
+
     def _generate_learning_time(self, target_time) -> int:
         if type(target_time) is int:
             return target_time

@@ -79,3 +79,16 @@ class TestRun:
         sco_posts = [r for r in fake.requests if r[1] == "https://welearn.sflep.com/Ajax/SCO.aspx"]
         assert len(sco_posts) == 0   # 循环入口即检查停止
         assert result["way1_succeed"] == 0
+
+
+class TestFetchSections:
+    def test_unit_index_is_one_based(self):
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
+            FakeResponse(json_data={"info": [{"location": "L1"}]})
+        task = welearn_accuracy.AccuracyTask("u", "p", on_log=lambda m: None)
+        task.session = fake
+        task.cid, task.uid, task.classid = "2833", "9", "K"
+        info = task.fetch_sections(3)
+        assert info[0]["location"] == "L1"
+        assert "unitidx=2" in fake.requests[0][1]
