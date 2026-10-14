@@ -58,3 +58,34 @@ class TestReloginAfterStop:
             assert app.task is not None
         finally:
             root.destroy()
+
+
+class RaisingFakeTask(FakeTask):
+    def login(self):
+        raise welearn_common.LoginError("帐号或密码错误!")
+
+
+class TestLoginFailurePath:
+    def test_failure_callback_reports_error_without_nameerror(self, monkeypatch):
+        """except 块结束会自动删除 as e;lambda 晚于块执行会 NameError(用户实测踩中)"""
+        monkeypatch.setattr(welearn_accuracy, "AccuracyTask", RaisingFakeTask)
+        shown = []
+        monkeypatch.setattr(gui.messagebox, "showerror",
+                            lambda title, msg, **k: shown.append(msg))
+        root = tk.Tk()
+        root.withdraw()
+        app = gui.WelearnApp(root)
+        app.username_entry.insert(0, "user")
+        app.password_entry.insert(0, "pass")
+        scheduled = []
+        monkeypatch.setattr(app.root, "after",
+                            lambda ms, func=None, *a: (scheduled.append((func, a)), "id")[1])
+        try:
+            app._on_login()
+            app.worker.join(timeout=5)
+            for func, args in list(scheduled):
+                func(*args)               # 此处曾抛 NameError: cannot access free variable 'e'
+            assert app.task is None
+            assert shown == ["帐号或密码错误!"]
+        finally:
+            root.destroy()

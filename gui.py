@@ -179,9 +179,11 @@ class WelearnApp:
                 courses = task.fetch_courses()
                 self.root.after(0, lambda: self._after_login(True, task, courses, None))
             except (LoginError, WelearnError) as e:
-                self.root.after(0, lambda: self._after_login(False, None, None, str(e)))
+                msg = str(e)   # except 块结束会自动删除 e,先取值再供 lambda 使用
+                self.root.after(0, lambda: self._after_login(False, None, None, msg))
             except Exception as e:
-                self.root.after(0, lambda: self._after_login(False, None, None, repr(e)))
+                msg = repr(e)
+                self.root.after(0, lambda: self._after_login(False, None, None, msg))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
@@ -214,7 +216,8 @@ class WelearnApp:
                 courses = self.task.fetch_courses()
                 self.root.after(0, lambda: self._after_refresh(courses, None))
             except (LoginError, WelearnError) as e:
-                self.root.after(0, lambda: self._after_refresh(None, str(e)))
+                msg = str(e)   # except 块结束会自动删除 e,先取值再供 lambda 使用
+                self.root.after(0, lambda: self._after_refresh(None, msg))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
@@ -250,7 +253,8 @@ class WelearnApp:
                 units = self.task.fetch_units(cid)
                 self.root.after(0, lambda: self._after_units(units, None))
             except (LoginError, WelearnError) as e:
-                self.root.after(0, lambda: self._after_units(None, str(e)))
+                msg = str(e)   # except 块结束会自动删除 e,先取值再供 lambda 使用
+                self.root.after(0, lambda: self._after_units(None, msg))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
@@ -303,7 +307,8 @@ class WelearnApp:
                 result = self.task.run(unit_index, param)
                 self.root.after(0, lambda: self._after_run(True, result, None))
             except Exception as e:
-                self.root.after(0, lambda: self._after_run(False, None, repr(e)))
+                msg = repr(e)   # except 块结束会自动删除 e,先取值再供 lambda 使用
+                self.root.after(0, lambda: self._after_run(False, None, msg))
 
         self.worker = threading.Thread(target=work, daemon=True)
         self.worker.start()
