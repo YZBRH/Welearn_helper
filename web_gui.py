@@ -586,7 +586,16 @@ $('loginBtn').addEventListener('click', function () {
           })
           .catch(function () { fillUnits([]); });
       } else {
-        fillUnits([]);
+        /* 首次登录:下拉默认高亮第一门课,但浏览器不会再触发 change——
+           必须主动加载其单元,否则"看起来选了课却没有单元" */
+        var firstCid = $('courseSel').value;
+        if (firstCid) {
+          apiPost('/api/units', {cid: Number(firstCid)})
+            .then(function (j2) { fillUnits(j2.ok ? j2.units : []); })
+            .catch(function () { fillUnits([]); });
+        } else {
+          fillUnits([]);
+        }
       }
       setControls(false);
     })
