@@ -263,9 +263,6 @@ def create_app():
         if section_map:
             desc += " 小节" + ",".join(
                 f"{u}:[{'/'.join(str(s) for s in secs)}]" for u, secs in section_map.items())
-        state.stop_event.clear()
-        state._set(True, "任务运行中")
-        state.log(f"开始任务:{desc} 参数={param}")
 
         def work():
             try:
@@ -284,7 +281,12 @@ def create_app():
         with state.lock:   # 忙检查与线程登记同锁,防止并发请求双双通过后重复起线程
             if state.worker_busy() or state.fetching:
                 return jsonify(ok=False, error="任务正在进行,请先停止"), 409
+            state.stop_event.clear()
+            # 通过忙检后才置运行状态:409 拒绝路径若提前置位,running 永远无人清除,界面卡死
+            state.running = True
+            state.running_what = "任务运行中"
             state.worker = threading.Thread(target=work, daemon=True)
+        state.log(f"开始任务:{desc} 参数={param}")
         state.worker.start()
         return jsonify(ok=True)
 
@@ -507,23 +509,48 @@ function renderSecs(no, sections) {
   }
 }
 
-/* 勾选单元时懒加载其小节;done 回调用于恢复勾选场景(加载完成后再打勾) */
+/* 勾选单元时懒加载其小节;done 回调用于恢复勾选场景(加载完成后再打勾)。
+   加载中重复调用会把 done 入队,由同一次请求返回后统一触发——
+   若按"有子节点即已完成"判断,先到的无回调调用会让后到的 done 在
+   "加载中"占位符上空跑,勾选恢复静默失效 */
 function ensureSecs(no, done) {
   var box = document.querySelector('.sec-box[data-no="' + no + '"]');
   if (!box) { if (done) done(); return; }
-  if (box.childNodes.length) { if (done) done(); return; }   // 已加载(或加载中)不重复请求
+  if (box.dataset.loaded === '1') { if (done) done(); return; }
+  if (done) {
+    if (!box._pendingDones) box._pendingDones = [];
+    box._pendingDones.push(done);
+  }
+  if (box.dataset.loading === '1') return;
+  box.dataset.loading = '1';
   var loading = document.createElement('div');
   loading.className = 'dim';
   loading.textContent = '-- 小节加载中... --';
   box.appendChild(loading);
+  var flush = function () {
+    var q = box._pendingDones || [];
+    box._pendingDones = [];
+    q.forEach(function (fn) { fn(); });
+  };
   apiPost('/api/sections', {unit_index: no})
     .then(function (j) {
-      if (!j.ok) { box.innerHTML = ''; appendLocal('加载小节失败:' + j.error); return; }
-      renderSecs(no, j.sections);
-      applyAllUnits();
-      if (done) done();
+      box.dataset.loading = '';
+      if (!j.ok) {
+        box.innerHTML = '';
+        appendLocal('加载小节失败:' + j.error);
+      } else {
+        renderSecs(no, j.sections);
+        applyAllUnits();
+        box.dataset.loaded = '1';
+      }
+      flush();
     })
-    .catch(function (err) { box.innerHTML = ''; appendLocal('请求失败:' + err); });
+    .catch(function (err) {
+      box.dataset.loading = '';
+      box.innerHTML = '';
+      appendLocal('请求失败:' + err);
+      flush();
+    });
 }
 
 function onUnitToggled(cb) {

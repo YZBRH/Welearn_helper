@@ -180,3 +180,6 @@ class TestMultiSelect:
         task = welearn_accuracy.AccuracyTask("u", "p", on_log=lambda m: None)
         with pytest.raises(ValueError):
             task.run([], 100)
+
+    # 边界输入的其余校验见 tests/test_welearn_common.py::TestNormalizeTargets
+    # (纯函数测试;经 AccuracyTask 会让未 mock 的真实 session 发网络请求,不可用)

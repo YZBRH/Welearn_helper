@@ -158,6 +158,8 @@ def normalize_targets(units, sections=None) -> Tuple[bool, Optional[List[int]], 
     sections: None/{}=整单元; 正整数=该单元单个小节; {单元编号: [小节编号]}=按单元多选
     非法输入抛 ValueError(界面直接展示给用户)。
     """
+    if isinstance(units, str):
+        raise ValueError("单元编号格式错误(不支持字符串)")   # "12"会被逐字符迭代成[1,2]
     all_units = units in (0, None)
     if all_units:
         unit_list = None
@@ -175,6 +177,8 @@ def normalize_targets(units, sections=None) -> Tuple[bool, Optional[List[int]], 
         if unit_list[0] < 1:
             raise ValueError("单元编号从1开始")
 
+    if isinstance(sections, str):
+        raise ValueError("小节编号格式错误(不支持字符串)")
     if sections in (None, {}, 0):
         return all_units, unit_list, None
     if all_units:
@@ -183,6 +187,8 @@ def normalize_targets(units, sections=None) -> Tuple[bool, Optional[List[int]], 
     if isinstance(sections, dict):
         section_map: Dict[int, List[int]] = {}
         for u, secs in sections.items():
+            if isinstance(secs, str):
+                raise ValueError("小节编号格式错误(不支持字符串)")
             try:
                 uno, sec_list = int(u), [int(s) for s in secs]
             except (TypeError, ValueError):
@@ -203,6 +209,9 @@ def normalize_targets(units, sections=None) -> Tuple[bool, Optional[List[int]], 
 
     if not section_map:
         return all_units, unit_list, None
+    for uno in section_map:
+        if uno not in (unit_list or []):
+            raise ValueError(f"单元{uno}未在选择的单元内,不能为其指定小节")
     return all_units, unit_list, section_map
 
 

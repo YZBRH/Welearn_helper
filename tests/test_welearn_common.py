@@ -2,6 +2,7 @@ import base64
 
 import pytest
 
+import welearn_common
 from welearn_common import generate_cipher_text, parse_numeric_param
 
 
@@ -78,3 +79,65 @@ class TestFetchSections:
             FakeResponse(text="出错了")
         with pytest.raises(welearn_common.WelearnError):
             welearn_common.fetch_sections(session, "1", "1", 99, "C")
+
+
+class TestNormalizeTargets:
+    """normalize_targets 纯函数行为:多选单元/小节目标的解析与校验。"""
+
+    def test_all_units_variants(self):
+        assert welearn_common.normalize_targets(0) == (True, None, None)
+        assert welearn_common.normalize_targets(None) == (True, None, None)
+
+    def test_single_unit(self):
+        assert welearn_common.normalize_targets(3) == (False, [3], None)
+
+    def test_unit_list_dedup_sorted(self):
+        assert welearn_common.normalize_targets([3, 1, 3]) == (False, [1, 3], None)
+
+    def test_string_unit_elements_coerced(self):
+        """JSON 键常为字符串;列表元素整体转 int(非逐字符)"""
+        assert welearn_common.normalize_targets(["3", "1"]) == (False, [1, 3], None)
+
+    def test_sections_map_normalized(self):
+        assert welearn_common.normalize_targets([1, 3], {"3": [2, 5, 2]}) == \
+            (False, [1, 3], {3: [2, 5]})
+
+    def test_scalar_section_spreads_to_units(self):
+        assert welearn_common.normalize_targets([1, 3], 2) == (False, [1, 3], {1: [2], 3: [2]})
+
+    def test_empty_sections_entries_dropped(self):
+        assert welearn_common.normalize_targets([1], {1: []}) == (False, [1], None)
+
+    def test_empty_unit_list_rejected(self):
+        with pytest.raises(ValueError, match="未选择任何单元"):
+            welearn_common.normalize_targets([])
+
+    def test_negative_unit_rejected(self):
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets(-1)
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets([0, 1])
+
+    def test_negative_section_rejected(self):
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets([1], {1: [0]})
+
+    def test_all_units_with_sections_rejected(self):
+        with pytest.raises(ValueError, match="具体单元"):
+            welearn_common.normalize_targets(0, {1: [1]})
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets(0, 3)
+
+    def test_section_key_outside_unit_list_rejected(self):
+        """小节键指向未选单元必须拒绝:静默丢弃会让整单元被刷(过度刷课)"""
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets([1], {5: [1]})
+
+    def test_string_inputs_rejected(self):
+        """裸字符串会逐字符迭代("12"→[1,2]),必须显式拒绝而非静默改目标"""
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets("12")
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets([1], "5")
+        with pytest.raises(ValueError):
+            welearn_common.normalize_targets([1], {1: "12"})

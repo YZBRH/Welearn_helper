@@ -267,6 +267,18 @@ class TestRefreshAfterTaskEnd:
         r = c.post("/api/start", json={"unit_index": 1, "param": "100"})
         assert r.status_code == 409
 
+    def test_rejected_start_does_not_wedge_running_state(self, client):
+        """409 拒绝时不得提前置 running=True,否则界面永久卡在"任务运行中"且无法恢复"""
+        c, state = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        state.fetching = True
+        c.post("/api/start", json={"units": [1], "param": "100"})
+        assert state.running is False
+        j = c.get("/api/status").get_json()
+        assert j["running"] is False
+        assert not any("开始任务" in m for _s, _t, m in j["logs"])
+
 
 class TestMultiSelectStart:
     def test_units_list_and_sections_map_passed(self, client):
@@ -304,6 +316,15 @@ class TestMultiSelectStart:
                                        "sections": {"1": [99]}})
         assert r.status_code == 400
         assert "1~2" in r.get_json()["error"]
+
+    def test_sections_key_outside_unit_list_rejected(self, client):
+        """小节键指向未勾选单元时必须拒绝,否则该小节被静默丢弃而整单元被刷"""
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        r = c.post("/api/start", json={"units": [1], "param": "100",
+                                       "sections": {"5": [1]}})
+        assert r.status_code == 400
 
 
 class TestStatusLogs:
