@@ -76,3 +76,26 @@ class TestRun:
         assert elapsed < 10
         assert task.stop_event.is_set()
         assert isinstance(result["total"], int)
+
+
+class TestSectionFilter:
+    def test_section_index_targets_single_chapter(self):
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = ok_ajax_response()
+        chapters = [{"id": 1, "location": "A", "learntime": 0},
+                    {"id": 2, "location": "B", "learntime": 0},
+                    {"id": 3, "location": "C", "learntime": 0}]
+        task = make_task(fake, chapters)
+        result = task.run(1, 1, section_index=3)
+        assert result["total"] == 1
+        assert result["succeed"] == 1
+        save_posts = [r for r in fake.requests
+                      if r[2] and r[2].get("action") == "savescoinfo160928"]
+        assert len(save_posts) == 1
+        assert save_posts[0][2]["scoid"] == 3
+
+    def test_section_with_all_units_rejected(self):
+        import pytest
+        task = welearn_time.TimeTask("u", "p", on_log=lambda m: None)
+        with pytest.raises(ValueError):
+            task.run(0, 30, section_index=1)

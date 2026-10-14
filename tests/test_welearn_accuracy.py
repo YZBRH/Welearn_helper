@@ -92,3 +92,43 @@ class TestFetchSections:
         info = task.fetch_sections(3)
         assert info[0]["location"] == "L1"
         assert "unitidx=2" in fake.requests[0][1]
+
+
+class TestSectionFilter:
+    def test_section_index_brushes_only_that_section(self):
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = FakeResponse(text='{"ret":0}')
+        chapters = [
+            {"id": 1, "location": "L1", "isvisible": "true", "iscomplete": "未完成"},
+            {"id": 2, "location": "L2", "isvisible": "true", "iscomplete": "未完成"},
+            {"id": 3, "location": "L3", "isvisible": "true", "iscomplete": "未完成"},
+        ]
+        task = make_task(fake, chapters)
+        result = task.run(1, 100, section_index=2)   # 只刷第2小节
+        assert result["way1_succeed"] == 1
+        sco_posts = [r for r in fake.requests if r[1] == "https://welearn.sflep.com/Ajax/SCO.aspx"]
+        assert len(sco_posts) == 3   # 仅第2小节: startsco+setsco+savesco
+        assert sco_posts[0][2]["scoid"] == 2
+
+    def test_section_over_range_logs_hint(self):
+        logs = []
+        fake = FakeSession()
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = FakeResponse(text='{"ret":0}')
+        task = welearn_accuracy.AccuracyTask("u", "p", on_log=logs.append)
+        task.session = fake
+        task.cid, task.uid, task.classid = "C1", "U1", "K1"
+        task.units = [{"unitname": "U1", "name": "Unit One"}]
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
+            FakeResponse(json_data={"info": [{"id": 1, "location": "L1",
+                                              "isvisible": "true", "iscomplete": "未完成"}]})
+        result = task.run(1, 100, section_index=9)
+        assert result["way1_succeed"] == 0
+        sco_posts = [r for r in fake.requests if r[1] == "https://welearn.sflep.com/Ajax/SCO.aspx"]
+        assert len(sco_posts) == 0
+        assert any("未找到第 9 小节" in m for m in logs)
+
+    def test_section_with_all_units_rejected(self):
+        import pytest
+        task = welearn_accuracy.AccuracyTask("u", "p", on_log=lambda m: None)
+        with pytest.raises(ValueError):
+            task.run(0, 100, section_index=1)

@@ -58,10 +58,13 @@ class AccuracyTask:
         return welearn_common.fetch_sections(self.session, self.cid, self.uid,
                                              unit_index - 1, self.classid)
 
-    def run(self, unit_index: int, param) -> Dict[str, Any]:
+    def run(self, unit_index: int, param, section_index: int = 0) -> Dict[str, Any]:
+        if unit_index == 0 and section_index:
+            raise ValueError("指定小节时请选择具体单元(单元id≥1)")
         random_mode = isinstance(param, tuple)
         way1_succeed, way2_succeed = 0, 0
         way1_failed, way2_failed = 0, 0
+        section_matched = not section_index   # 是否命中过指定小节(用于越界提示)
 
         info_headers = {
             "Referer": f"https://welearn.sflep.com/2019/student/course_info.aspx?cid={self.cid}",
@@ -84,9 +87,13 @@ class AccuracyTask:
             if "异常" in response.text or "出错了" in response.text:
                 break
 
-            for course in response.json()["info"]:
+            for no, course in enumerate(response.json()["info"], start=1):
                 if self._stopped():
                     break
+                if section_index and no != section_index:
+                    continue   # 指定小节模式:只刷编号等于 section_index 的小节
+                if section_index:
+                    section_matched = True
                 if course['isvisible'] == 'false':  # 跳过未开放课程
                     self.on_log(f'[!!跳过!!]    {course["location"]}')
                 elif "未" in course["iscomplete"]:  # 章节未完成
@@ -142,6 +149,9 @@ class AccuracyTask:
             if not advance_until_error:
                 break
             unit += 1
+
+        if section_index and not section_matched:
+            self.on_log(f"[!] 未找到第 {section_index} 小节(超出该单元小节编号)")
 
         return {'way1_succeed': way1_succeed, 'way1_failed': way1_failed,
                 'way2_succeed': way2_succeed, 'way2_failed': way2_failed}

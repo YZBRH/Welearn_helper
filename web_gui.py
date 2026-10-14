@@ -36,6 +36,8 @@ class AppState:
         self.mode = "accuracy"
         self.courses: List[dict] = []
         self.units: List[dict] = []
+        self.sections: List[dict] = []
+        self.sections_unit = 0
         self.running = False
         self.running_what = "待命"
         self.last_result: Optional[dict] = None
@@ -178,6 +180,8 @@ def create_app():
             state.task = None
             state.courses = []
             state.units = []
+            state.sections = []
+            state.sections_unit = 0
             state.last_result = None
         state.log("已切换模式或退出登录,请重新登录")
         return jsonify(ok=True)
@@ -214,6 +218,9 @@ def create_app():
         sections = [{"location": x.get("location", ""),
                      "complete": "未" not in x.get("iscomplete", "未"),
                      "visible": x.get("isvisible", "true") != "false"} for x in raw]
+        with state.lock:
+            state.sections = sections     # 记住编号依据,供 /api/start 校验小节范围
+            state.sections_unit = unit_index
         state._set(False, "待命")
         state.log(f"单元 {unit_index} 共 {len(sections)} 个小节")
         return jsonify(ok=True, sections=sections)
@@ -230,16 +237,30 @@ def create_app():
         except (TypeError, ValueError):
             return jsonify(ok=False, error="单元id必须是数字(0=全部)"), 400
         try:
+            section_index = int(payload.get("section_index", 0))
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="小节id必须是数字(0=全部)"), 400
+        if section_index < 0:
+            return jsonify(ok=False, error="小节id不能为负(0=全部)"), 400
+        if section_index > 0 and unit_index == 0:
+            return jsonify(ok=False, error="指定小节时需选择具体单元(单元id≥1)"), 400
+        with state.lock:
+            limit = len(state.sections) if (unit_index > 0
+                                            and state.sections_unit == unit_index
+                                            and state.sections) else None
+        if limit is not None and section_index > limit:
+            return jsonify(ok=False, error=f"小节id超出范围(1~{limit})"), 400
+        try:
             param = welearn_common.parse_numeric_param(str(payload.get("param", "")))
         except ValueError as e:
             return jsonify(ok=False, error=f"参数格式错误:{e}\n模式1: 100   模式2: 70,100"), 400
         state.stop_event.clear()
         state._set(True, "任务运行中")
-        state.log(f"开始任务:单元id={unit_index} 参数={param}")
+        state.log(f"开始任务:单元id={unit_index} 小节id={section_index} 参数={param}")
 
         def work():
             try:
-                result = state.task.run(unit_index, param)
+                result = state.task.run(unit_index, param, section_index)
             except Exception as e:
                 msg = repr(e)   # except 块结束会自动删除 e,先取值再使用
                 state._set(False, "待命")
@@ -346,6 +367,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <legend>任务参数</legend>
 <div class="row">
   单元id(0=全部):<input type="text" id="unitIndex" value="0" size="4">
+  小节id(0=全部):<input type="text" id="sectionIndex" value="0" size="4">
   <span id="paramLabel">正确率(100 或 70,100):</span>
   <input type="text" id="param" size="12">
 </div>
@@ -414,15 +436,16 @@ function renderSections(sections) {
   for (var i = 0; i < sections.length; i++) {
     var s = sections[i];
     var line = document.createElement('div');
+    var no = (i + 1) + '. ';   // 编号即小节id,对应任务参数"小节id(0=全部)"
     if (!s.visible) {
       line.className = 'sec-hidden';
-      line.textContent = '[未开放] ' + s.location;
+      line.textContent = no + '[未开放] ' + s.location;
     } else if (s.complete) {
       line.className = 'sec-done';
-      line.textContent = '[已完成] ' + s.location;
+      line.textContent = no + '[已完成] ' + s.location;
     } else {
       line.className = 'sec-todo';
-      line.textContent = '[未完成] ' + s.location;
+      line.textContent = no + '[未完成] ' + s.location;
     }
     box.appendChild(line);
   }
@@ -519,6 +542,7 @@ $('courseSel').addEventListener('change', function () {
 $('unitSel').addEventListener('change', function () {
   var v = $('unitSel').value;
   if (v !== '') $('unitIndex').value = v;
+  $('sectionIndex').value = '0';   // 编号随单元重置,防止旧小节id误用
   if (v && v !== '0') {
     apiPost('/api/sections', {unit_index: Number(v)})
       .then(function (j) {
@@ -534,7 +558,10 @@ $('unitSel').addEventListener('change', function () {
 $('startBtn').addEventListener('click', function () {
   var unitIndex = parseInt($('unitIndex').value, 10);
   if (isNaN(unitIndex) || unitIndex < 0) { alert('单元id必须是数字(0=全部)'); return; }
-  apiPost('/api/start', {unit_index: unitIndex, param: $('param').value})
+  var sectionIndex = parseInt($('sectionIndex').value, 10);
+  if (isNaN(sectionIndex) || sectionIndex < 0) { alert('小节id必须是数字(0=全部)'); return; }
+  if (sectionIndex > 0 && unitIndex === 0) { alert('指定小节时需先选择具体单元(单元id≥1)'); return; }
+  apiPost('/api/start', {unit_index: unitIndex, section_index: sectionIndex, param: $('param').value})
     .then(function (j) {
       if (!j.ok) { alert(j.error); return; }
       setControls(true);

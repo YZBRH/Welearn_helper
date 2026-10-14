@@ -65,7 +65,9 @@ class TimeTask:
             return target_time
         return random.randint(target_time[0], target_time[1])
 
-    def run(self, unit_index: int, param) -> Dict[str, Any]:
+    def run(self, unit_index: int, param, section_index: int = 0) -> Dict[str, Any]:
+        if unit_index == 0 and section_index:
+            raise ValueError("指定小节时请选择具体单元(单元id≥1)")
         target_time = param
         errors: List[str] = []
         max_learning_time = 0
@@ -82,7 +84,9 @@ class TimeTask:
             response = self.session.get(
                 f"https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves&cid={self.cid}&uid={self.uid}&unitidx={str(unit)}&classid={self.classid}",
                 headers={'Referer': 'https://welearn.sflep.com/2019/student/course_info.aspx?cid=' + self.cid})
-            for chapter in response.json()['info']:
+            for no, chapter in enumerate(response.json()['info'], start=1):
+                if section_index and no != section_index:
+                    continue   # 指定小节模式:只刷编号等于 section_index 的小节
                 learning_time = self._generate_learning_time(target_time)
                 if learning_time > max_learning_time:
                     max_learning_time = learning_time

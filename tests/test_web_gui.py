@@ -32,9 +32,10 @@ class FakeTask:
         return [{"location": "U1 > A", "iscomplete": "completed", "isvisible": "true"},
                 {"location": "U1 > B", "iscomplete": "未完成", "isvisible": "false"}]
 
-    def run(self, unit_index, param):
+    def run(self, unit_index, param, section_index=0):
+        self.last_run_args = (unit_index, param, section_index)
         time.sleep(0.2)   # 让"任务运行中"状态可被观测,避免与断言竞态
-        self.on_log(f"fake run unit={unit_index} param={param}")
+        self.on_log(f"fake run unit={unit_index} param={param} section={section_index}")
         return {"way1_succeed": 1, "way1_failed": 0,
                 "way2_succeed": 1, "way2_failed": 0}
 
@@ -201,6 +202,38 @@ class TestSections:
         c.post("/api/units", json={"cid": 11})
         assert c.post("/api/sections", json={"unit_index": 0}).status_code == 400
         assert c.post("/api/sections", json={"unit_index": 9}).status_code == 400
+
+
+class TestStartSection:
+    def test_start_passes_section_index_to_task(self, client):
+        c, state = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        c.post("/api/sections", json={"unit_index": 1})
+        j = c.post("/api/start", json={"unit_index": 1, "param": "100",
+                                       "section_index": 2}).get_json()
+        assert j["ok"] is True
+        state.worker.join(timeout=5)
+        assert FakeTask.instances[-1].last_run_args == (1, 100, 2)
+
+    def test_section_with_all_units_rejected(self, client):
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        r = c.post("/api/start", json={"unit_index": 0, "param": "100",
+                                       "section_index": 1})
+        assert r.status_code == 400
+        assert "具体单元" in r.get_json()["error"]
+
+    def test_section_over_known_range_rejected(self, client):
+        c, _ = client
+        login(client)
+        c.post("/api/units", json={"cid": 11})
+        c.post("/api/sections", json={"unit_index": 1})   # 2 个小节
+        r = c.post("/api/start", json={"unit_index": 1, "param": "100",
+                                       "section_index": 99})
+        assert r.status_code == 400
+        assert "1~2" in r.get_json()["error"]
 
 
 class TestStatusLogs:
