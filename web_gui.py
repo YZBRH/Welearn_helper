@@ -241,7 +241,8 @@ def create_app():
     return app, state
 
 
-INDEX_HTML = """<!DOCTYPE html>
+# raw 字符串:JS 里的 \n 必须原样送达浏览器;若被 Python 转义成真换行,字符串字面量断行 → SyntaxError
+INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">

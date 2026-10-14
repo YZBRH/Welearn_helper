@@ -146,6 +146,15 @@ class TestLogout:
         assert r.status_code == 400
 
 
+class TestPageJs:
+    def test_alert_strings_keep_literal_backslash_n(self, client):
+        """INDEX_HTML 若非 raw 字符串,JS 里的 \\n 会被 Python 先转义成真换行,
+        字符串字面量被折断 → 浏览器 Uncaught SyntaxError(用户实测踩中)"""
+        c, _ = client
+        body = c.get("/").get_data(as_text=True)
+        assert "alert('登录失败\\n'" in body   # 必须是字面量 反斜杠+n
+
+
 class TestStatusLogs:
     def test_incremental_logs_after_seq(self, client):
         c, state = client
