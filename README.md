@@ -4,9 +4,12 @@
 
 原项目已停止更新维护,无法直接使用,现进行修正调整后已恢复其原功能
 
-该脚本版权归于原作者,本项目仅进行修复优化
+该脚本版权归于原作者,本项目仅进行修复与优化
 
-现由 [lxbsdsg](https://github.com/lxbsdsg/Welearn_helper) 更新维护
+目前维护者：
+
+- [YZBRH](https://github.com/YZBRH/)
+- [lxbsdsg](https://github.com/lxbsdsg/)
 
 # 使用
 
@@ -37,3 +40,9 @@
 2026.10.14
 
 图形界面改为 Web 版(Flask,自动打开浏览器),移除 tkinter 版;修复登录失败时回调报 NameError 的问题
+
+
+
+2026.10.16
+
+更正表述，移除旧版本exe构建，修正一键启动脚本
