@@ -4,7 +4,8 @@ import welearn_accuracy
 print("**********  Created By Avenshy & SSmJaE  **********")
 print("                 刷完成Version:0.4dev")
 print("         原项目作者github https://github.com/Avenshy")
-print("         更新维护者github https://github.com/YZBRH/Welearn_helper/")
+print("         更新维护者github https://github.com/YZBRH")
+print("                         https://github.com/lxbsdsg")
 print("***************************************************\n")
 
 if __name__ == '__main__':
