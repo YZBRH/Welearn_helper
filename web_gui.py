@@ -184,7 +184,7 @@ def create_app():
 
     @app.route("/api/logout", methods=["POST"])
     def api_logout():
-        """作废当前登录(切换模式时调用):旧 task 不得再用新参数运行"""
+        """作废当前登录:旧 task 不得再用新参数运行"""
         if state.worker_busy() or state.fetching:
             return jsonify(ok=False, error="任务正在进行,请先停止"), 409
         with state.lock:
@@ -193,8 +193,43 @@ def create_app():
             state.units = []
             state.sections_map = {}
             state.last_result = None
-        state.log("已切换模式或退出登录,请重新登录")
+        state.log("已退出登录,请重新登录")
         return jsonify(ok=True)
+
+    @app.route("/api/mode", methods=["POST"])
+    def api_mode():
+        payload = request.get_json(silent=True) or {}
+        mode = payload.get("mode")
+        if mode not in ("accuracy", "time"):
+            return jsonify(ok=False, error="未知模式"), 400
+
+        with state.lock:
+            if state.mode == mode:
+                return jsonify(ok=True, mode=mode)
+
+            if state.task is None:
+                state.mode = mode
+            else:
+                if state.running or state.worker_busy() or state.fetching:
+                    return jsonify(ok=False, error="任务正在进行,请先停止"), 409
+
+                old_task = state.task
+                cls = (welearn_accuracy.AccuracyTask if mode == "accuracy"
+                       else welearn_time.TimeTask)
+                task = cls(old_task.username, old_task.password,
+                           on_log=state.log, stop_event=state.stop_event,
+                           session=old_task.session)
+                for attribute in ("cid", "uid", "classid"):
+                    setattr(task, attribute, getattr(old_task, attribute, ""))
+                task.units = list(getattr(old_task, "units", []) or [])
+
+                state.task = task
+                state.mode = mode
+                state.last_result = None
+
+        mode_name = "刷学习时长" if mode == "time" else "刷完成度正确率"
+        state.log(f"已切换到{mode_name}模式,无需重新登录")
+        return jsonify(ok=True, mode=mode)
 
     @app.route("/api/sections", methods=["POST"])
     def api_sections():
@@ -554,6 +589,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 'use strict';
 var lastSeq = 0;
 var courses = [];
+var modeSwitching = false;
+window.__hasTask = false;
 var $ = function (id) { return document.getElementById(id); };
 
 function apiPost(path, body) {
@@ -567,12 +604,26 @@ function getMode() {
   return checked ? checked.value : 'accuracy';
 }
 
+function setModeLabel() {
+  $('paramLabel').textContent = getMode() === 'time'
+    ? '每练习时长秒(30 或 10,30):' : '正确率(100 或 70,100):';
+}
+
+function selectMode(mode) {
+  var radio = document.querySelector('input[name=mode][value="' + mode + '"]');
+  if (radio) radio.checked = true;
+  setModeLabel();
+}
+
 function setControls(running) {
-  var busy = running;
+  var busy = running || modeSwitching;
   $('loginBtn').disabled = busy;
   $('refreshBtn').disabled = busy;
   $('startBtn').disabled = busy || !window.__hasTask;
   $('stopBtn').disabled = !busy;
+  document.querySelectorAll('input[name=mode]').forEach(function (radio) {
+    radio.disabled = busy;
+  });
   $('statusPill').classList.toggle('running', busy);
 }
 
@@ -874,14 +925,38 @@ function refreshAll(kind) {
 
 document.querySelectorAll('input[name=mode]').forEach(function (radio) {
   radio.addEventListener('change', function () {
-    fillCourses([]);
-    resetTree();
-    window.__hasTask = false;
+    var newMode = getMode();
+    var previousMode = newMode === 'time' ? 'accuracy' : 'time';
+    setModeLabel();
+    if (!window.__hasTask) {
+      appendLocal('已切换模式,登录后生效');
+      return;
+    }
+
+    modeSwitching = true;
     setControls(false);
-    $('paramLabel').textContent = getMode() === 'time'
-      ? '每练习时长秒(30 或 10,30):' : '正确率(100 或 70,100):';
-    appendLocal('已切换模式,请重新登录');
-    apiPost('/api/logout', {}).catch(function () {});   // 作废服务端旧 task
+    apiPost('/api/mode', {mode: newMode})
+      .then(function (j) {
+        if (!j.ok) {
+          selectMode(previousMode);
+          alert('切换模式失败\n' + j.error);
+          modeSwitching = false;
+          setControls(false);
+          return;
+        }
+        appendLocal('已切换模式,无需重新登录');
+        modeSwitching = false;
+        setControls(false);
+      })
+      .catch(function () {
+        selectMode(previousMode);
+        apiPost('/api/mode', {mode: previousMode})
+          .catch(function () {})
+          .then(function () {
+            modeSwitching = false;
+            setControls(false);
+          });
+      });
   });
 });
 
@@ -978,6 +1053,7 @@ function poll() {
       }
       wasRunning = j.running;
       window.__hasTask = j.has_task;
+      if (j.has_task && j.mode && !modeSwitching) selectMode(j.mode);
       $('statusText').textContent = j.running_what;
       setControls(j.running);
     })
