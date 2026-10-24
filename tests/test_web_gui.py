@@ -6,6 +6,7 @@ import pytest
 import web_gui
 import welearn_accuracy
 import welearn_common
+import welearn_time
 
 
 class FakeTask:
@@ -13,10 +14,17 @@ class FakeTask:
 
     instances = []
 
-    def __init__(self, username, password, on_log=None, stop_event=None):
+    def __init__(self, username, password, on_log=None, stop_event=None,
+                 session=None):
         self.username = username
+        self.password = password
         self.on_log = on_log
         self.stop_event = stop_event
+        self.session = session or object()
+        self.cid = ""
+        self.uid = ""
+        self.classid = ""
+        self.units = []
         FakeTask.instances.append(self)
 
     def login(self):
@@ -139,7 +147,7 @@ class TestStartStop:
 
 class TestLogout:
     def test_logout_clears_task(self, client):
-        """切模式必须作废服务端旧 task,否则不重登就能用旧模式跑新参数"""
+        """退出登录必须作废服务端旧 task"""
         c, state = client
         login(client)
         assert state.task is not None
@@ -152,6 +160,45 @@ class TestLogout:
         assert r.status_code == 400
 
 
+class TestModeSwitch:
+    def test_reuses_session_and_course_context(self, client, monkeypatch):
+        monkeypatch.setattr(welearn_time, "TimeTask", FakeTask)
+        c, state = client
+        login(client)
+        old_task = state.task
+        old_task.cid, old_task.uid, old_task.classid = "11", "7", "K9"
+        old_task.units = [{"unitname": "U1", "name": "第一单元"}]
+        state.units = old_task.units
+        state.sections_map = {1: [{"location": "U1 > A"}]}
+
+        r = c.post("/api/mode", json={"mode": "time"})
+        j = r.get_json()
+        assert r.status_code == 200 and j["ok"] is True and j["mode"] == "time"
+        assert state.mode == "time"
+        assert state.task is not old_task
+        assert state.task.session is old_task.session
+        assert (state.task.cid, state.task.uid, state.task.classid) == ("11", "7", "K9")
+        assert state.task.units == old_task.units
+        assert state.courses and state.units == old_task.units
+        assert state.sections_map == {1: [{"location": "U1 > A"}]}
+
+    def test_same_mode_does_not_create_task(self, client):
+        c, state = client
+        login(client)
+        instance_count = len(FakeTask.instances)
+        r = c.post("/api/mode", json={"mode": "accuracy"})
+        assert r.get_json() == {"ok": True, "mode": "accuracy"}
+        assert len(FakeTask.instances) == instance_count
+
+    def test_rejects_switch_while_running(self, client):
+        c, state = client
+        login(client)
+        state.running = True
+        r = c.post("/api/mode", json={"mode": "time"})
+        assert r.status_code == 409
+        assert state.mode == "accuracy"
+
+
 class TestPageJs:
     def test_alert_strings_keep_literal_backslash_n(self, client):
         """INDEX_HTML 若非 raw 字符串,JS 里的 \\n 会被 Python 先转义成真换行,
@@ -159,6 +206,20 @@ class TestPageJs:
         c, _ = client
         body = c.get("/").get_data(as_text=True)
         assert "alert('登录失败\\n'" in body   # 必须是字面量 反斜杠+n
+
+    def test_mode_switch_reuses_login_without_logout(self, client):
+        c, _ = client
+        body = c.get("/").get_data(as_text=True)
+        selector = "document.querySelectorAll('input[name=mode]')"
+        first = body.index(selector)
+        start = body.index(selector, first + len(selector))
+        end = body.index("$('loginBtn')", start)
+        handler = body[start:end]
+        assert "/api/mode" in handler
+        assert "/api/logout" not in handler
+        assert "无需重新登录" in handler
+        assert "fillCourses([])" not in handler
+        assert "resetTree()" not in handler
 
 
 class TestQuietStatusPoll:

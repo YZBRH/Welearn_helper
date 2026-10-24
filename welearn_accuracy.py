@@ -26,12 +26,13 @@ class AccuracyTask:
 
     def __init__(self, username: str, password: str,
                  on_log: Optional[Callable[[str], None]] = None,
-                 stop_event: Optional[threading.Event] = None):
+                 stop_event: Optional[threading.Event] = None,
+                 session: Optional[Any] = None):
         self.username = username
         self.password = password
         self.on_log = on_log or _default_log
         self.stop_event = stop_event or threading.Event()
-        self.session = welearn_common.new_session()
+        self.session = session or welearn_common.new_session()
         self.cid = ''
         self.uid = ''
         self.classid = ''

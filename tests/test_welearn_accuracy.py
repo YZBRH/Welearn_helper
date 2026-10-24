@@ -19,6 +19,11 @@ def make_task(fake, chapters):
 
 
 class TestUnitIteration:
+    def test_reuses_provided_session(self):
+        session = object()
+        task = welearn_accuracy.AccuracyTask("u", "p", session=session)
+        assert task.session is session
+
     def test_all_units_run_until_server_error(self):
         fake = FakeSession()
         fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = FakeResponse(text='{"ret":0}')

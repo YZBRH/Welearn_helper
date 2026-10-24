@@ -24,6 +24,11 @@ def ok_ajax_response():
 
 
 class TestFetchUnits:
+    def test_reuses_provided_session(self):
+        session = object()
+        task = welearn_time.TimeTask("u", "p", session=session)
+        assert task.session is session
+
     def test_keeps_original_request_sequence(self):
         fake = FakeSession()
         fake.routes["https://welearn.sflep.com/2019/student/course_info.aspx"] = \
