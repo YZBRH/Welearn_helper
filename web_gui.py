@@ -21,7 +21,8 @@ from welearn_common import LoginError, WelearnError
 BANNER = """**********  Created By Avenshy & SSmJaE  **********
                     Web界面Version:1.0
         原项目作者github https://github.com/Avenshy
-        更新维护者github https://github.com/lxbsdsg/Welearn_helper/
+        更新维护者github https://github.com/YZBRH
+                        https://github.com/lxbsdsg
 ***************************************************"""
 
 
@@ -364,7 +365,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   /* 双栏工作区:左=配置(浅),右=执行(深) */
   .workspace { display: grid; grid-template-columns: 400px minmax(0, 1fr); gap: 14px;
                align-items: stretch; }
-  .rail { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  /* align-self:start:左栏保持自然高度(任务参数底即两栏底),供日志区对齐,
+     不随右栏日志内容被拉伸 */
+  .rail { display: flex; flex-direction: column; gap: 14px; min-width: 0; align-self: start; }
   .ops-col { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
   .p-head { display: flex; align-items: center; gap: 9px; padding: 10px 14px;
@@ -472,7 +475,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <h1>Welearn Helper</h1>
     <span class="sub">刷课工作台(原项目 <a href="https://github.com/Avenshy" target="_blank"
       rel="noreferrer">Avenshy</a> &amp; SSmJaE,由 <a
-      href="https://github.com/lxbsdsg/Welearn_helper/" target="_blank"
+      href="https://github.com/YZBRH/" target="_blank"
+      rel="noreferrer">YZBRH</a>、<a
+      href="https://github.com/lxbsdsg/" target="_blank"
       rel="noreferrer">lxbsdsg</a> 维护)</span>
   </div>
   <span class="pill" id="statusPill"><span class="dot"></span><span id="statusText">待命</span></span>
@@ -965,6 +970,22 @@ $('stopBtn').addEventListener('click', function () {
 });
 
 var wasRunning = false;
+
+/* 运行日志区高度对齐左栏(任务参数底部):日志超出部分在区内滚动,不撑高页面。
+   网格行高会被日志内容撑大,纯 CSS 无法约束,故由 JS 把右栏上限钉在左栏自然高度 */
+(function () {
+  var rail = document.querySelector('.rail');
+  var opsCol = document.querySelector('.ops-col');
+  var twoCol = window.matchMedia('(min-width: 941px)');   /* 与 CSS 双栏断点(max-width:940px)一致 */
+  function syncConsole() {
+    if (!twoCol.matches) { opsCol.style.maxHeight = ''; return; }
+    opsCol.style.maxHeight = rail.offsetHeight + 'px';
+  }
+  if (window.ResizeObserver) new ResizeObserver(syncConsole).observe(rail);
+  if (twoCol.addEventListener) twoCol.addEventListener('change', syncConsole);
+  window.addEventListener('resize', syncConsole);
+  syncConsole();
+})();
 
 function poll() {
   fetch('/api/status?after=' + lastSeq)
