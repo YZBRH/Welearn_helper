@@ -47,8 +47,20 @@ python -u web_gui.py
 - `WELEARN_PORT`：修改监听端口（默认 17777）
 - `WELEARN_NO_OPEN=1`：跳过自动打开浏览器（适合无桌面/远程环境）
 
-## 命令行
+## 打包 / 使用 Windows 可执行文件
 
+从 GitHub Release 下载 `WelearnHelper.exe` 后直接双击运行，无需安装 Python；程序会在本机启动 Web 图形界面并自动打开浏览器。
+
+本仓库维护者可重新打包：
+
+```
+python -m pip install -r requirement.txt -r requirements-dev.txt
+powershell -ExecutionPolicy Bypass -File scripts/build_exe.ps1
+```
+
+打包产物为 `dist/WelearnHelper.exe`。推送 `v*` 标签后，GitHub Actions 会运行测试、打包并把 EXE 与 SHA-256 校验文件上传到 GitHub Release。
+
+## 命令行
 双击 命令行启动.bat，或手动运行：
 
 ```
@@ -107,3 +119,7 @@ docker run -it --rm welearn-helper
 2026.10.25
 
 更正维护者表述，与项目声明一致（YZBRH、lxbsdsg）；运行日志超出任务参数底部时改为日志区内滚动，不再撑高页面
+
+2026.11.1 v0.4.0
+
+发布 Windows 单文件图形界面版 `WelearnHelper.exe`；统一版本号为 0.4.0，新增本地打包脚本与 tag 触发的 Windows 发布流程；修正依赖清单，避免 Python 3 中安装过时 `typing` 包导致无法打包

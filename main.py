@@ -1,8 +1,9 @@
+from version import __version__
 import welearn_time
 import welearn_accuracy
 
 print("**********  Created By Avenshy & SSmJaE  **********")
-print("                 刷完成Version:0.4dev")
+print("                 刷完成Version:" + __version__)
 print("         原项目作者github https://github.com/Avenshy")
 print("         更新维护者github https://github.com/YZBRH")
 print("                         https://github.com/lxbsdsg")
