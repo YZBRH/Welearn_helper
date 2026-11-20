@@ -4,3 +4,4 @@ build/
 __pycache__/
 dist/
 .vscode/
+_logs/access.log*

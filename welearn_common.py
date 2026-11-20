@@ -215,6 +215,16 @@ def normalize_targets(units, sections=None) -> Tuple[bool, Optional[List[int]], 
     return all_units, unit_list, section_map
 
 
+def is_unfinished(section) -> bool:
+    """章节是否未完成(沿用原判定:iscomplete 里含「未」)"""
+    return "未" in str(section.get("iscomplete", "未"))
+
+
+def is_visible(section) -> bool:
+    """章节是否已开放(isvisible 为字符串 'false' 时视为未开放)"""
+    return str(section.get("isvisible", "true")).lower() != "false"
+
+
 def fetch_sections(session, cid: str, uid: str, unitidx: int, classid: str) -> List[dict]:
     """只读拉取指定单元的小节列表(scoLeaves,与刷课遍历同一接口;不提交任何数据)"""
     response = session.get(

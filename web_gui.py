@@ -5,19 +5,32 @@
 """
 import logging
 import os
+import re
 import threading
 import time
 import webbrowser
 from collections import deque
+from logging.handlers import RotatingFileHandler
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, request
+from flask import Flask, cli as flask_cli, jsonify, request
 
 import welearn_accuracy
 import welearn_common
+import welearn_flow
 import welearn_time
 from version import __version__
 from welearn_common import LoginError, WelearnError
+
+_TASK_MODES = ("accuracy", "time", "queue")
+
+
+def _task_class(mode):
+    """按模式取控制器类(请求时取,便于测试 monkeypatch)"""
+    return {"accuracy": welearn_accuracy.AccuracyTask,
+            "time": welearn_time.TimeTask,
+            "queue": welearn_flow.FlowTask}[mode]
+
 
 BANNER = f"""**********  Created By Avenshy & SSmJaE  **********
                     Web界面Version:{__version__}
@@ -25,6 +38,9 @@ BANNER = f"""**********  Created By Avenshy & SSmJaE  **********
         更新维护者github https://github.com/YZBRH
                         https://github.com/lxbsdsg
 ***************************************************"""
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_logs")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class AppState:
@@ -34,7 +50,7 @@ class AppState:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.worker: Optional[threading.Thread] = None
-        self.task = None                      # AccuracyTask 或 TimeTask
+        self.task = None                      # AccuracyTask / TimeTask / FlowTask
         self.mode = "accuracy"
         self.courses: List[dict] = []
         self.units: List[dict] = []
@@ -42,6 +58,9 @@ class AppState:
         self.running = False
         self.running_what = "待命"
         self.fetching = False       # 课程/单元/小节拉取进行中(与任务运行区分)
+        self.skip_event = threading.Event()   # 顺序任务:跳过当前课程
+        self.queue: List[dict] = []           # 顺序任务:本次队列快照
+        self.queue_summary: Optional[dict] = None
         self.last_result: Optional[dict] = None
         self.logs: Deque[Tuple[int, str, str]] = deque(maxlen=2000)
         self._log_seq = 0
@@ -75,20 +94,90 @@ class AppState:
         self._hint("待命")
 
 
+def _hms(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分"
+    if minutes:
+        return f"{minutes} 分 {secs} 秒"
+    return f"{secs} 秒"
+
+
 def _format_result(mode: str, result: dict) -> List[str]:
     if mode == "time":
         lines = [f"运行结束!!错误: {result['failed']} 个"]
         for i, err in enumerate(result["errors"], start=1):
             lines.append(f"第{i}个错误:{err}")
         return lines
+    if mode == "queue":
+        lines = [f"顺序任务结束:完成 {result['done']} 节 · 跳过 {result['skipped']} 节 · "
+                 f"失败 {result['failed']} 节 · 用时 {_hms(result['elapsed'])}"]
+        for i, course in enumerate(result.get("courses", []), start=1):
+            lines.append(f"  {i}. NO.{course['no']} {course['name']} [{course['status']}] "
+                         f"完成 {course['done']} / 跳过 {course['skipped']} / "
+                         f"失败 {course['failed']}")
+            for err in course.get("errors", []):
+                lines.append(f"     - {err}")
+        return lines
     return ["方式1: {} 成功, {} 失败".format(result["way1_succeed"], result["way1_failed"]),
             "方式2: {} 成功, {} 失败".format(result["way2_succeed"], result["way2_failed"])]
+
 
 
 def create_app():
     """应用工厂,便于测试隔离。返回 (app, state)。"""
     app = Flask(__name__)
     state = AppState()
+
+    def _selected_courses(payload):
+        """把界面传来的 cid 列表换成课程快照,并按课程编号(课程列表序号)升序"""
+        raw = payload.get("cids")
+        if isinstance(raw, str):
+            raw = [x for x in raw.split(",") if x.strip()]
+        if not raw:
+            raise ValueError("请至少选择一门课程")
+        index = {str(course.get("cid")): i for i, course in enumerate(state.courses)}
+        picked, seen = [], set()
+        for item in raw:
+            cid = str(item).strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            if cid not in index:
+                raise ValueError(f"课程 {cid} 不在当前课程列表中,请先刷新课程")
+            course = state.courses[index[cid]]
+            picked.append({"no": index[cid] + 1, "cid": cid,
+                           "name": course.get("name", ""), "per": course.get("per", 0)})
+        picked.sort(key=lambda course: course["no"])   # 按课程编号顺序
+        return picked
+
+    def _queue_params(payload):
+        def span(key, label):
+            raw = payload.get(key)
+            if raw in (None, ""):
+                raise ValueError(f"请填写{label}")
+            return welearn_flow.to_span(raw)
+
+        def bounds(value):
+            return value if isinstance(value, tuple) else (value, value)
+
+        accuracy = span("accuracy", "正确率")
+        duration = span("duration", "学习时长")
+        pause = welearn_flow.to_span(payload.get("pause") or list(welearn_flow.DEFAULT_PAUSE))
+        acc_lo, acc_hi = bounds(accuracy)
+        if acc_lo < 0:
+            raise ValueError("正确率不能为负数")
+        if acc_hi > 100:
+            raise ValueError("正确率不能超过 100")
+        for value, label in ((duration, "学习时长"), (pause, "节间休息")):
+            lo, _hi = bounds(value)
+            if lo < 0:
+                raise ValueError(f"{label}不能为负数")
+        return {"accuracy": accuracy, "duration": duration, "pause": pause,
+                "skip_done": bool(payload.get("skip_done", True))}
+
 
     @app.route("/")
     def index():
@@ -100,16 +189,20 @@ def create_app():
         username = str(payload.get("username", "")).strip()
         password = str(payload.get("password", ""))
         mode = payload.get("mode", "accuracy")
-        if mode not in ("accuracy", "time"):
+        if mode not in _TASK_MODES:
             return jsonify(ok=False, error="未知模式"), 400
         if not username or not password:
             return jsonify(ok=False, error="请输入账号和密码"), 400
         if state.worker_busy():
             return jsonify(ok=False, error="任务正在进行,请先停止"), 409
         state.stop_event.clear()   # 此前点过"停止"不得阻塞新的登录
+        state.skip_event.clear()
         state._hint("登录中...")
-        cls = welearn_accuracy.AccuracyTask if mode == "accuracy" else welearn_time.TimeTask
-        task = cls(username, password, on_log=state.log, stop_event=state.stop_event)
+        cls = _task_class(mode)
+        kwargs = {"on_log": state.log, "stop_event": state.stop_event}
+        if mode == "queue":
+            kwargs["skip_event"] = state.skip_event   # 只有 FlowTask 认这个参数
+        task = cls(username, password, **kwargs)
         try:
             task.login()
             courses = task.fetch_courses()
@@ -127,6 +220,8 @@ def create_app():
             state.courses = courses
             state.units = []
             state.sections_map = {}
+            state.queue = []
+            state.queue_summary = None
             state.last_result = None
         state._hint("待命")
         state.log(f"共 {len(courses)} 门课程,请在课程列表中选择")
@@ -202,7 +297,7 @@ def create_app():
     def api_mode():
         payload = request.get_json(silent=True) or {}
         mode = payload.get("mode")
-        if mode not in ("accuracy", "time"):
+        if mode not in _TASK_MODES:
             return jsonify(ok=False, error="未知模式"), 400
 
         with state.lock:
@@ -216,20 +311,23 @@ def create_app():
                     return jsonify(ok=False, error="任务正在进行,请先停止"), 409
 
                 old_task = state.task
-                cls = (welearn_accuracy.AccuracyTask if mode == "accuracy"
-                       else welearn_time.TimeTask)
-                task = cls(old_task.username, old_task.password,
-                           on_log=state.log, stop_event=state.stop_event,
-                           session=old_task.session)
+                cls = _task_class(mode)
+                kwargs = {"on_log": state.log, "stop_event": state.stop_event,
+                          "session": old_task.session}
+                if mode == "queue":
+                    kwargs["skip_event"] = state.skip_event
+                task = cls(old_task.username, old_task.password, **kwargs)
                 for attribute in ("cid", "uid", "classid"):
                     setattr(task, attribute, getattr(old_task, attribute, ""))
                 task.units = list(getattr(old_task, "units", []) or [])
 
                 state.task = task
                 state.mode = mode
+                state.queue = []
+                state.queue_summary = None
                 state.last_result = None
 
-        mode_name = "刷学习时长" if mode == "time" else "刷完成度正确率"
+        mode_name = {"queue": "顺序刷取", "time": "刷学习时长"}.get(mode, "刷完成度正确率")
         state.log(f"已切换到{mode_name}模式,无需重新登录")
         return jsonify(ok=True, mode=mode)
 
@@ -333,6 +431,161 @@ def create_app():
         state.log("已请求停止,等待任务收尾...")
         return jsonify(ok=True)
 
+    @app.route("/api/queue/preview", methods=["POST"])
+    def api_queue_preview():
+        """只读侦察:统计每门课程的小节数并给出耗时预估(不写入任何数据)"""
+        payload = request.get_json(silent=True) or {}
+        if state.task is None:
+            return jsonify(ok=False, error="请先登录"), 400
+        if state.running or state.worker_busy() or state.fetching:
+            return jsonify(ok=False, error="任务正在进行,请先停止"), 409
+        try:
+            picked = _selected_courses(payload)
+            params = _queue_params(payload)
+            all_units, unit_list, section_map = welearn_common.normalize_targets(
+                payload.get("units", 0), payload.get("sections") or None)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+
+        state.stop_event.clear()
+        state._fetch_begin("预估耗时中...")
+        # 用临时任务实例侦察,避免污染 state.task 的 cid/units 上下文
+        probe = welearn_flow.FlowTask(getattr(state.task, "username", ""),
+                                      getattr(state.task, "password", ""),
+                                      on_log=lambda msg: None,
+                                      stop_event=state.stop_event,
+                                      session=state.task.session)
+        rows, total_seconds = [], 0.0
+        try:
+            for course in picked:
+                try:
+                    units = probe.fetch_units(course["cid"])
+                except (LoginError, WelearnError) as e:
+                    rows.append({**course, "units": 0, "sections": 0, "error": str(e)})
+                    continue
+                count = 0
+                indices = (range(len(units)) if all_units
+                           else [uno - 1 for uno in unit_list if 0 < uno <= len(units)])
+                for unit_index in indices:
+                    unit = units[unit_index]
+                    if str(unit.get("visible", "true")).lower() == "false":
+                        continue
+                    try:
+                        sections = probe.fetch_sections(unit_index + 1)
+                    except Exception:
+                        continue
+                    wanted = section_map.get(unit_index + 1) if section_map else None
+                    count += len([no for no in range(1, len(sections) + 1)
+                                  if not wanted or no in wanted])
+                per_section = (welearn_flow.avg_of(params["duration"])
+                               + welearn_flow.avg_of(params["pause"])
+                               + 4 * welearn_flow.DEFAULT_REQUEST_INTERVAL)
+                total_seconds += count * per_section
+                rows.append({**course, "units": len(units), "sections": count, "error": ""})
+        finally:
+            state._fetch_end()
+
+        sections = sum(row["sections"] for row in rows)
+        state.log(f"预估完成:{len(picked)} 门课程共 {sections} 个小节,"
+                  f"按当前参数预计 {_hms(total_seconds)}")
+        return jsonify(ok=True, rows=rows, sections=sections,
+                       seconds=int(total_seconds), eta=_hms(total_seconds))
+
+    @app.route("/api/queue/start", methods=["POST"])
+    def api_queue_start():
+        payload = request.get_json(silent=True) or {}
+        if state.task is None:
+            return jsonify(ok=False, error="请先登录"), 400
+        if not state.courses:
+            return jsonify(ok=False, error="请先登录并刷新课程"), 400
+        try:
+            picked = _selected_courses(payload)
+            params = _queue_params(payload)
+            all_units, unit_list, section_map = welearn_common.normalize_targets(
+                payload.get("units", 0), payload.get("sections") or None)
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+        if section_map:
+            with state.lock:
+                known_map = dict(state.sections_map)
+            for uno, secs in section_map.items():
+                known = known_map.get(uno)
+                if known and max(secs) > len(known):
+                    return jsonify(ok=False,
+                                   error=f"单元{uno}小节id超出范围(1~{len(known)})"), 400
+        try:
+            jobs = [welearn_flow.normalize_job(
+                {"no": course["no"], "cid": course["cid"], "name": course["name"],
+                 "units": 0 if all_units else unit_list,
+                 "sections": section_map or None,
+                 "accuracy": params["accuracy"], "duration": params["duration"],
+                 "pause": params["pause"], "skip_done": params["skip_done"]})
+                for course in picked]
+        except ValueError as e:
+            return jsonify(ok=False, error=str(e)), 400
+
+        def work():
+            try:
+                summary = state.task.run_queue(jobs)
+            except Exception as e:
+                msg = repr(e)   # except 块结束会自动删除 e,先取值再使用
+                state._set(False, "待命")
+                state.log(f"顺序任务异常终止:{msg}")
+                return
+            with state.lock:
+                state.queue_summary = summary
+                state.last_result = summary
+            state._set(False, "待命")
+            for line in _format_result("queue", summary):
+                state.log(line)
+
+        switched = False
+        with state.lock:   # 忙检查与线程登记同锁
+            if state.worker_busy() or state.fetching:
+                return jsonify(ok=False, error="任务正在进行,请先停止"), 409
+            if state.mode != "queue" or not hasattr(state.task, "run_queue"):
+                old_task = state.task
+                cls = _task_class("queue")
+                kwargs = {"on_log": state.log, "stop_event": state.stop_event,
+                          "session": old_task.session, "skip_event": state.skip_event}
+                state.task = cls(getattr(old_task, "username", ""),
+                                 getattr(old_task, "password", ""), **kwargs)
+                for attribute in ("cid", "uid", "classid"):
+                    setattr(state.task, attribute, getattr(old_task, attribute, ""))
+                state.task.units = list(getattr(old_task, "units", []) or [])
+                state.mode = "queue"
+                switched = True
+            state.stop_event.clear()
+            state.skip_event.clear()
+            state.queue = jobs
+            state.queue_summary = None
+            state.running = True
+            state.running_what = "顺序任务运行中"
+            state.worker = threading.Thread(target=work, daemon=True)
+
+        if switched:
+            state.log("已切换到顺序刷取模式,无需重新登录")
+        scope = "全部单元" if all_units else "单元" + ",".join(str(u) for u in unit_list)
+        if section_map:
+            scope += " 小节" + ",".join(
+                f"{uno}:[{'/'.join(str(s) for s in secs)}]"
+                for uno, secs in section_map.items())
+        state.log(f"开始顺序任务:共 {len(jobs)} 门课程(按课程编号顺序) · {scope} · "
+                  f"正确率 {params['accuracy']} · 学习时长 {params['duration']}")
+        state.worker.start()
+        return jsonify(ok=True, total=len(jobs), scope=scope,
+                       queue=[{"no": job["no"], "name": job["name"]} for job in jobs])
+
+    @app.route("/api/queue/skip", methods=["POST"])
+    def api_queue_skip():
+        if state.task is None:
+            return jsonify(ok=False, error="请先登录"), 400
+        if not state.running:
+            return jsonify(ok=False, error="当前没有运行中的任务"), 409
+        state.skip_event.set()
+        state.log("已请求跳过当前课程,队列将执行下一门")
+        return jsonify(ok=True)
+
     @app.route("/api/status")
     def api_status():
         try:
@@ -341,8 +594,15 @@ def create_app():
             after = 0
         with state.lock:
             logs = [list(entry) for entry in state.logs if entry[0] > after]
+            queue = None
+            if state.queue:
+                queue = {"total": len(state.queue),
+                         "names": [job.get("name", "") for job in state.queue],
+                         "summary": state.queue_summary}
+                queue.update(dict(getattr(state.task, "progress", None) or {}))
             return jsonify(running=state.running, running_what=state.running_what,
-                           has_task=state.task is not None, mode=state.mode, logs=logs)
+                           has_task=state.task is not None, mode=state.mode,
+                           logs=logs, queue=queue)
 
     return app, state
 
@@ -353,6 +613,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>Welearn Helper · 刷课工作台</title>
 <style>
   :root {
@@ -472,6 +733,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .tag-off { color: #6A7683; background: #EEF1F4; }
   .dim { color: var(--ink-3); font-size: 12.5px; padding: 4px 6px; }
 
+  /* 只给「任务参数」面板里直接堆叠的字段加间距;写成后代选择器会连带命中
+     会话面板 .grid-2 里的第二个 field,把"密码"整列推下去造成错位 */
+  .p-body > .field + .field { margin-top: 10px; }
+  .btn-skip { background: transparent; border-color: #4A5D70; color: #B9C9D8; }
+  .btn-skip:hover:not(:disabled) { background: #1B2632; border-color: #647D93; color: var(--ops-ink); }
+
   /* 执行区:深色,呼应控制台 */
   .ops { background: var(--ops); border-color: var(--ops-line); color: var(--ops-ink); }
   .runbar { padding: 12px 16px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
@@ -536,6 +803,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
             <label class="radio"><input type="radio" name="mode" value="accuracy" checked>刷完成度正确率</label>
             <label class="radio"><input type="radio" name="mode" value="time">刷学习时长</label>
           </span>
+          <span class="row-inline">
+            <label class="radio"><input type="radio" name="mode" value="queue">顺序刷取</label>
+          </span>
         </div>
         <button id="loginBtn" class="btn btn-blue btn-block">登录</button>
       </div>
@@ -543,16 +813,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
     <section class="panel">
       <div class="p-head"><span class="p-step">2</span><span class="p-title">课程</span></div>
-      <div class="p-body row-inline">
-        <select id="courseSel" class="grow"><option value="">-- 请先登录 --</option></select>
-        <button id="refreshBtn" class="btn">刷新课程</button>
+      <div class="p-body">
+        <div class="row-inline">
+          <select id="courseSel" class="grow"><option value="">-- 请先登录 --</option></select>
+          <button id="refreshBtn" class="btn">刷新课程</button>
+        </div>
       </div>
     </section>
 
     <section class="panel">
       <div class="p-head"><span class="p-step">3</span><span class="p-title">单元与小节</span></div>
       <div class="p-body">
-        <p class="tip">勾选要刷的单元;勾选单元后展开小节。勾选小节 = 只刷勾选的,不勾 = 刷整个单元。</p>
+        <p class="tip" id="unitTip">勾选要刷的单元;勾选单元后展开小节。勾选小节 = 只刷勾选的,不勾 = 刷整个单元。</p>
         <label class="all-row" for="allUnits"><input type="checkbox" id="allUnits">全部单元(忽略下方勾选)</label>
         <div id="unitTree"></div>
       </div>
@@ -561,8 +833,23 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <section class="panel">
       <div class="p-head"><span class="p-step">4</span><span class="p-title">任务参数</span></div>
       <div class="p-body">
-        <div class="field"><span class="f-label" id="paramLabel">正确率(100 或 70,100):</span>
-          <input type="text" id="param"></div>
+        <div class="field" id="accField">
+          <span class="f-label" id="paramLabel">正确率(100 或 70,100):</span>
+          <input type="text" id="param">
+        </div>
+        <div class="field" id="durField" style="display:none">
+          <span class="f-label">学习时长秒(30 或 40,90):</span>
+          <input type="text" id="paramDur">
+        </div>
+        <div class="field" id="pauseField" style="display:none">
+          <span class="f-label">节间休息秒(3 或 3,12):</span>
+          <input type="text" id="paramPause" value="3,12">
+        </div>
+        <label class="all-row" id="skipDoneRow"
+               style="display:none;border:0;padding:0;margin:10px 0 0">
+          <input type="checkbox" id="skipDone" checked>跳过已完成章节(不覆盖已有成绩)
+        </label>
+        <button id="estimateBtn" class="btn btn-block" style="display:none">预估总耗时</button>
       </div>
     </section>
   </div>
@@ -574,6 +861,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <span id="runSummary">未选择单元</span>
       </div>
       <div class="run-actions">
+        <button id="skipBtn" class="btn btn-lg btn-skip" style="display:none" disabled>跳过当前课程</button>
         <button id="startBtn" class="btn btn-lg btn-run" disabled>开始任务</button>
         <button id="stopBtn" class="btn btn-lg btn-stop" disabled>停止</button>
       </div>
@@ -596,6 +884,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 var lastSeq = 0;
 var courses = [];
 var modeSwitching = false;
+var lastMode = 'accuracy';
 window.__hasTask = false;
 var $ = function (id) { return document.getElementById(id); };
 
@@ -615,10 +904,27 @@ function setModeLabel() {
     ? '每练习时长秒(30 或 10,30):' : '正确率(100 或 70,100):';
 }
 
+/* 顺序刷取:任务参数同时出现「正确率」与「学习时长」两个输入框;
+   课程与范围仍由「课程」下拉框 + 「单元与小节」勾选决定 */
+function applyModeUI() {
+  var queue = getMode() === 'queue';
+  $('durField').style.display = queue ? '' : 'none';
+  $('pauseField').style.display = queue ? '' : 'none';
+  $('skipDoneRow').style.display = queue ? 'flex' : 'none';
+  $('estimateBtn').style.display = queue ? '' : 'none';
+  $('skipBtn').style.display = queue ? '' : 'none';
+  $('unitTip').textContent = queue
+    ? '勾选要刷的单元与小节:顺序刷取按单元顺序串行刷完勾选范围(勾选小节 = 只刷勾选的,不勾 = 刷整个单元)。'
+    : '勾选要刷的单元;勾选单元后展开小节。勾选小节 = 只刷勾选的,不勾 = 刷整个单元。';
+  setModeLabel();
+  applyAllUnits();
+}
+
 function selectMode(mode) {
   var radio = document.querySelector('input[name=mode][value="' + mode + '"]');
   if (radio) radio.checked = true;
   setModeLabel();
+  applyModeUI();
 }
 
 function setControls(running) {
@@ -627,6 +933,7 @@ function setControls(running) {
   $('refreshBtn').disabled = busy;
   $('startBtn').disabled = busy || !window.__hasTask;
   $('stopBtn').disabled = !busy;
+  $('skipBtn').disabled = !(running && getMode() === 'queue');
   document.querySelectorAll('input[name=mode]').forEach(function (radio) {
     radio.disabled = busy;
   });
@@ -651,6 +958,20 @@ function fillCourses(list, keepSelection) {
       if (sel.options[k].value === prev) { sel.value = prev; break; }
     }
   }
+}
+
+/* 顺序刷取以「课程」下拉框选中的那门课为准(按单元顺序串行刷完) */
+function pickedCids() {
+  var cid = $('courseSel').value;
+  return cid ? [cid] : [];
+}
+
+function selectedCourseName() {
+  var cid = $('courseSel').value;
+  for (var i = 0; i < courses.length; i++) {
+    if (String(courses[i].cid) === cid) return courses[i].name;
+  }
+  return '';
 }
 
 function tag(text, cls) {
@@ -812,10 +1133,32 @@ function applyAllUnits() {
   updateSummary();
 }
 
+/* 顺序刷取的运行条摘要:课程名 + 单元/小节范围 + 两组区间参数 */
+function queueSelectionSummary() {
+  var name = selectedCourseName();
+  if (!name) return '请先在课程下拉框中选择课程';
+  var scope = '未选择单元';
+  var sel = buildSelection();
+  if (sel.allUnits) {
+    scope = '全部单元';
+  } else if (sel.units.length) {
+    var secs = 0;
+    Object.keys(sel.sections).forEach(function (k) { secs += sel.sections[k].length; });
+    scope = sel.units.length + ' 个单元' + (secs ? ' / ' + secs + ' 个小节' : '');
+  }
+  var acc = $('param').value.trim();
+  var dur = $('paramDur').value.trim();
+  var parts = [scope];
+  if (acc) parts.push('正确率 ' + acc);
+  if (dur) parts.push('时长 ' + dur + 's');
+  return '顺序刷取 · ' + name + ' · ' + parts.join(' · ');
+}
+
 /* 运行条摘要:实时反映勾选目标与参数(纯展示,选择仍以 buildSelection 为准) */
 function updateSummary() {
   var el = $('runSummary');
   if (!el) return;
+  if (getMode() === 'queue') { el.textContent = queueSelectionSummary(); return; }
   var p = $('param').value.trim();
   var suffix = p ? '(参数 ' + p + ')' : '';
   if ($('allUnits').checked) {
@@ -932,8 +1275,9 @@ function refreshAll(kind) {
 document.querySelectorAll('input[name=mode]').forEach(function (radio) {
   radio.addEventListener('change', function () {
     var newMode = getMode();
-    var previousMode = newMode === 'time' ? 'accuracy' : 'time';
-    setModeLabel();
+    var previousMode = lastMode;
+    lastMode = newMode;
+    applyModeUI();
     if (!window.__hasTask) {
       appendLocal('已切换模式,登录后生效');
       return;
@@ -944,6 +1288,7 @@ document.querySelectorAll('input[name=mode]').forEach(function (radio) {
     apiPost('/api/mode', {mode: newMode})
       .then(function (j) {
         if (!j.ok) {
+          lastMode = previousMode;
           selectMode(previousMode);
           alert('切换模式失败\n' + j.error);
           modeSwitching = false;
@@ -953,8 +1298,10 @@ document.querySelectorAll('input[name=mode]').forEach(function (radio) {
         appendLocal('已切换模式,无需重新登录');
         modeSwitching = false;
         setControls(false);
+        updateSummary();
       })
       .catch(function () {
+        lastMode = previousMode;
         selectMode(previousMode);
         apiPost('/api/mode', {mode: previousMode})
           .catch(function () {})
@@ -977,6 +1324,7 @@ $('loginBtn').addEventListener('click', function () {
       if (!j.ok) { alert('登录失败\n' + j.error); return; }
       window.__hasTask = true;
       fillCourses(j.courses, true);
+      applyModeUI();
       if (prevCourse && $('courseSel').value === prevCourse
           && (prevSel.units.length || prevSel.allUnits)) {
         /* 重新登录且课程未变:自动恢复单元与小节勾选,无需重选 */
@@ -1021,9 +1369,85 @@ $('courseSel').addEventListener('change', function () {
 
 $('allUnits').addEventListener('change', applyAllUnits);
 $('param').addEventListener('input', updateSummary);
+$('paramDur').addEventListener('input', updateSummary);
 $('clearBtn').addEventListener('click', function () { $('log').innerHTML = ''; });
 
+/* 顺序刷取:按「课程」下拉框选中的课程 + 单元/小节勾选生成队列 */
+function startQueue() {
+  var cids = pickedCids();
+  if (!cids.length) { alert('请先在课程下拉框中选择课程'); return; }
+  var sel = buildSelection();
+  if (!sel.allUnits && !sel.units.length) {
+    alert('请勾选要刷的单元,或勾选"全部单元"');
+    return;
+  }
+  var accuracy = $('param').value.trim();
+  var duration = $('paramDur').value.trim();
+  if (!accuracy || !duration) { alert('顺序刷取需要同时填写正确率与学习时长'); return; }
+  apiPost('/api/queue/start', {cids: cids,
+                               units: sel.allUnits ? 0 : sel.units,
+                               sections: sel.allUnits ? null : sel.sections,
+                               accuracy: accuracy, duration: duration,
+                               pause: $('paramPause').value,
+                               skip_done: $('skipDone').checked})
+    .then(function (j) {
+      if (!j.ok) { alert(j.error); return; }
+      setControls(true);
+      $('statusText').textContent = '顺序任务运行中';
+      appendLocal('[界面] 顺序任务已开始:共 ' + j.total + ' 门课程,按课程编号顺序执行');
+    })
+    .catch(function (err) { alert('请求失败:' + err); });
+}
+
+$('skipBtn').addEventListener('click', function () {
+  apiPost('/api/queue/skip', {})
+    .then(function (j) {
+      if (!j.ok) { alert(j.error); return; }
+      appendLocal('[界面] 已请求跳过当前课程');
+    })
+    .catch(function (err) { alert('请求失败:' + err); });
+});
+
+$('estimateBtn').addEventListener('click', function () {
+  var cids = pickedCids();
+  if (!cids.length) { alert('请先在课程下拉框中选择课程'); return; }
+  if (!$('param').value.trim() || !$('paramDur').value.trim()) {
+    alert('请先填写正确率与学习时长');
+    return;
+  }
+  var sel = buildSelection();
+  if (!sel.allUnits && !sel.units.length) {
+    alert('请勾选要刷的单元,或勾选"全部单元"');
+    return;
+  }
+  $('estimateBtn').disabled = true;
+  $('statusText').textContent = '预估耗时中...';
+  apiPost('/api/queue/preview', {cids: cids,
+                                 units: sel.allUnits ? 0 : sel.units,
+                                 sections: sel.allUnits ? null : sel.sections,
+                                 accuracy: $('param').value,
+                                 duration: $('paramDur').value,
+                                 pause: $('paramPause').value})
+    .then(function (j) {
+      $('estimateBtn').disabled = false;
+      $('statusText').textContent = '待命';
+      if (!j.ok) { alert('预估失败\n' + j.error); return; }
+      appendLocal('[预估] ' + j.rows.length + ' 门课程共 ' + j.sections
+                  + ' 个小节,按当前参数预计 ' + j.eta);
+      j.rows.forEach(function (r) {
+        appendLocal('   NO.' + r.no + ' ' + r.name + ' · '
+                    + (r.error ? ('失败:' + r.error) : (r.sections + ' 节')));
+      });
+      $('runSummary').textContent = '预计 ' + j.eta + '(' + j.sections + ' 节)';
+    })
+    .catch(function (err) {
+      $('estimateBtn').disabled = false;
+      alert('请求失败:' + err);
+    });
+});
+
 $('startBtn').addEventListener('click', function () {
+  if (getMode() === 'queue') { startQueue(); return; }
   var sel = buildSelection();
   if (!sel.allUnits && !sel.units.length) {
     alert('请至少勾选一个单元,或勾选"全部单元"');
@@ -1075,7 +1499,15 @@ function poll() {
       }
       wasRunning = j.running;
       window.__hasTask = j.has_task;
-      if (j.has_task && j.mode && !modeSwitching) selectMode(j.mode);
+      if (j.has_task && j.mode && !modeSwitching && j.mode !== getMode()) {
+        lastMode = j.mode;
+        selectMode(j.mode);
+      }
+      if (j.running && j.queue && j.queue.course_pos) {
+        $('runSummary').textContent = '第 ' + j.queue.course_pos + '/' + j.queue.course_total
+          + ' 门 · 单元 ' + (j.queue.unit_no || 0) + '/' + (j.queue.unit_total || 0)
+          + ' · 小节 ' + (j.queue.section_no || 0) + '/' + (j.queue.section_total || 0);
+      }
       $('statusText').textContent = j.running_what;
       setControls(j.running);
     })
@@ -1083,6 +1515,7 @@ function poll() {
 }
 
 renderTree([]);
+applyModeUI();
 poll();
 setInterval(poll, 1000);
 </script>
@@ -1092,18 +1525,59 @@ setInterval(poll, 1000);
 
 
 class _QuietStatusPoll(logging.Filter):
-    """控制台隐藏 /api/status 轮询访问行(每秒一条会刷屏),其余访问行保留"""
+    """日志里不记 /api/status 轮询(每秒一条会刷屏),其余访问行保留"""
 
     def filter(self, record):
         return "/api/status" not in record.getMessage()
 
 
+class _PlainAccessFormatter(logging.Formatter):
+    """去掉 Werkzeug 写进日志的 ANSI 颜色码,文件里保持纯文本"""
+
+    def __init__(self):
+        super().__init__("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    def format(self, record):
+        return ANSI_RE.sub("", super().format(record))
+
+
+def _setup_werkzeug_logging():
+    """把 Werkzeug 的启动提示与访问日志改写到 _logs/access.log。
+
+    控制台里那几行彩色文字全部出自 Werkzeug,不是本项目的代码:
+      - 红字 "WARNING: This is a development server..."  serving.py log_startup
+      - 黄字 "Press CTRL+C to quit"                      serving.py run_simple
+      - 黄字 404 / 红字其它 4xx 的请求行                  serving.py log_request
+    日志本身不丢,只换出口;控制台只保留本项目自己的输出。
+    返回挂上去的 handler,便于测试断言。
+    """
+    logger = logging.getLogger("werkzeug")
+    logger.handlers.clear()
+    # 不落回 root:否则 root 没有 handler 时会走 lastResort,WARNING 仍会打到 stderr
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        handler = RotatingFileHandler(os.path.join(LOG_DIR, "access.log"),
+                                      maxBytes=1_000_000, backupCount=2,
+                                      encoding="utf-8")
+    except (OSError, ValueError):
+        handler = logging.NullHandler()   # 目录不可写也不能因此起不来
+    handler.setFormatter(_PlainAccessFormatter())
+    logger.addFilter(_QuietStatusPoll())
+    logger.addHandler(handler)
+    return handler
+
+
 def main():
-    logging.getLogger("werkzeug").addFilter(_QuietStatusPoll())
+    _setup_werkzeug_logging()
+    # "* Debug mode: off" / "* Serving Flask app" 两行由 Flask 的横幅函数打印,置空即可
+    flask_cli.show_server_banner = lambda *args, **kwargs: None
     port = int(os.environ.get("WELEARN_PORT", "17777"))
     url = f"http://127.0.0.1:{port}/"
     print(BANNER)
     print(f"Web 界面地址: {url}  (Ctrl+C 退出)")
+    print(f"访问日志: {os.path.join(LOG_DIR, 'access.log')}")
     if os.environ.get("WELEARN_NO_OPEN") != "1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(host="127.0.0.1", port=port, threaded=True)
