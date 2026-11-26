@@ -3,9 +3,11 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from welearn_common import LoginError, WelearnError
 from welearn_common import parse_numeric_param
-from welearn_study import DEFAULT_SECTION_GAP_SECONDS, StudyTask
-
-DEFAULT_STUDY_SECONDS = (20, 40)
+from welearn_study import (
+    DEFAULT_SECTION_GAP_SECONDS,
+    DEFAULT_STUDY_SECONDS,
+    StudyTask,
+)
 
 
 class AccuracyTask(StudyTask):

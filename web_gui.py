@@ -17,6 +17,7 @@ import welearn_accuracy
 import welearn_common
 import welearn_time
 from welearn_common import LoginError, WelearnError
+from welearn_study import MAX_PARALLEL_WORKERS
 
 BANNER = """**********  Created By Avenshy & SSmJaE  **********
                     Web界面Version:1.0
@@ -75,13 +76,36 @@ class AppState:
 
 
 def _format_result(mode: str, result: dict) -> List[str]:
-    if mode == "time":
-        lines = [f"运行结束!!错误: {result['failed']} 个"]
-        for i, err in enumerate(result["errors"], start=1):
+    if (result.get("accuracy_submitted")
+            or (mode == "accuracy" and "way1_succeed" in result)):
+        lines = [
+            "方式1: {} 成功, {} 失败".format(
+                result.get("way1_succeed", 0), result.get("way1_failed", 0)
+            ),
+            "方式2: {} 成功, {} 失败".format(
+                result.get("way2_succeed", 0), result.get("way2_failed", 0)
+            ),
+        ]
+        if "succeed" in result:
+            lines.append(
+                "学习记录: {} 成功, {} 失败".format(
+                    result.get("succeed", 0), result.get("failed", 0)
+                )
+            )
+        return lines
+    if mode in ("time", "combined"):
+        failures = result.get("errors", [])
+        lines = [f"运行结束!!错误: {result.get('failed', len(failures))} 个"]
+        for i, err in enumerate(failures, start=1):
             lines.append(f"第{i}个错误:{err}")
         return lines
     return ["方式1: {} 成功, {} 失败".format(result["way1_succeed"], result["way1_failed"]),
             "方式2: {} 成功, {} 失败".format(result["way2_succeed"], result["way2_failed"])]
+
+
+def _parse_optional_numeric(value):
+    text = str(value if value is not None else "").strip()
+    return welearn_common.parse_numeric_param(text) if text else None
 
 
 def create_app():
@@ -99,7 +123,7 @@ def create_app():
         username = str(payload.get("username", "")).strip()
         password = str(payload.get("password", ""))
         mode = payload.get("mode", "accuracy")
-        if mode not in ("accuracy", "time"):
+        if mode not in ("accuracy", "time", "combined"):
             return jsonify(ok=False, error="未知模式"), 400
         if not username or not password:
             return jsonify(ok=False, error="请输入账号和密码"), 400
@@ -201,7 +225,7 @@ def create_app():
     def api_mode():
         payload = request.get_json(silent=True) or {}
         mode = payload.get("mode")
-        if mode not in ("accuracy", "time"):
+        if mode not in ("accuracy", "time", "combined"):
             return jsonify(ok=False, error="未知模式"), 400
 
         with state.lock:
@@ -228,7 +252,11 @@ def create_app():
                 state.mode = mode
                 state.last_result = None
 
-        mode_name = "刷学习时长" if mode == "time" else "刷完成度正确率"
+        mode_name = {
+            "accuracy": "刷完成度正确率",
+            "time": "刷学习时长",
+            "combined": "时长与正确率",
+        }[mode]
         state.log(f"已切换到{mode_name}模式,无需重新登录")
         return jsonify(ok=True, mode=mode)
 
@@ -291,18 +319,56 @@ def create_app():
                 if known and max(secs) > len(known):
                     return jsonify(ok=False,
                                    error=f"单元{uno}小节id超出范围(1~{len(known)})"), 400
+        run_mode = state.mode
+        has_unified_fields = "duration" in payload or "accuracy" in payload
         try:
-            param = welearn_common.parse_numeric_param(str(payload.get("param", "")))
-        except ValueError as e:
-            return jsonify(ok=False, error=f"参数格式错误:{e}\n模式1: 100   模式2: 70,100"), 400
+            if run_mode == "combined" or has_unified_fields:
+                duration = _parse_optional_numeric(
+                    payload.get("duration", payload.get("param"))
+                )
+                accuracy = _parse_optional_numeric(payload.get("accuracy"))
+                param = duration
+                parallel_workers = int(payload.get("parallel_workers", 1))
+                if not 1 <= parallel_workers <= MAX_PARALLEL_WORKERS:
+                    raise ValueError(
+                        f"并发小节数必须在 1~{MAX_PARALLEL_WORKERS} 之间"
+                    )
+            else:
+                param = welearn_common.parse_numeric_param(
+                    str(payload.get("param", ""))
+                )
+                accuracy = None
+                parallel_workers = 1
+        except (TypeError, ValueError) as e:
+            return jsonify(
+                ok=False,
+                error=f"参数格式错误:{e}\n示例: 时长 30 / 10,30;正确率 100 / 70,100",
+            ), 400
         desc = "全部单元" if all_units else "单元" + ",".join(str(u) for u in unit_list)
         if section_map:
             desc += " 小节" + ",".join(
                 f"{u}:[{'/'.join(str(s) for s in secs)}]" for u, secs in section_map.items())
+        if run_mode == "combined" or has_unified_fields:
+            desc += (
+                f" 时长={param if param is not None else '20,40'}"
+                f" 正确率={accuracy if accuracy is not None else '保留原值'}"
+                f" 并发={parallel_workers}"
+            )
 
         def work():
             try:
-                result = state.task.run(0 if all_units else unit_list, param, section_map)
+                if run_mode == "combined" or has_unified_fields:
+                    result = state.task.run(
+                        0 if all_units else unit_list,
+                        param,
+                        section_map,
+                        accuracy=accuracy,
+                        parallel_workers=parallel_workers,
+                    )
+                else:
+                    result = state.task.run(
+                        0 if all_units else unit_list, param, section_map
+                    )
             except Exception as e:
                 msg = repr(e)   # except 块结束会自动删除 e,先取值再使用
                 state._set(False, "待命")
@@ -311,7 +377,7 @@ def create_app():
             with state.lock:
                 state.last_result = result
             state._set(False, "待命")
-            for line in _format_result(state.mode, result):
+            for line in _format_result(run_mode, result):
                 state.log(line)
 
         with state.lock:   # 忙检查与线程登记同锁,防止并发请求双双通过后重复起线程
@@ -414,9 +480,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   /* 表单 */
   .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+  .field-gap { margin-top: 10px; }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
   .f-label { font-size: 12px; color: var(--ink-2); }
-  input[type=text], input[type=password], select {
+  input[type=text], input[type=password], input[type=number], select {
     height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px;
     background: #fff; color: var(--ink); font: inherit; min-width: 0; width: 100%;
   }
@@ -530,12 +597,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <div class="field"><span class="f-label">密码</span>
             <input type="password" id="password" autocomplete="current-password"></div>
         </div>
-        <div class="field"><span class="f-label">模式</span>
-          <span class="row-inline">
-            <label class="radio"><input type="radio" name="mode" value="accuracy" checked>刷完成度正确率</label>
-            <label class="radio"><input type="radio" name="mode" value="time">刷学习时长</label>
-          </span>
-        </div>
         <button id="loginBtn" class="btn btn-blue btn-block">登录</button>
       </div>
     </section>
@@ -560,8 +621,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <section class="panel">
       <div class="p-head"><span class="p-step">4</span><span class="p-title">任务参数</span></div>
       <div class="p-body">
-        <div class="field"><span class="f-label" id="paramLabel">正确率(100 或 70,100):</span>
-          <input type="text" id="param"></div>
+        <div class="field"><label class="f-label" for="duration">每项学习时长秒(默认 20,40):</label>
+          <input type="text" id="duration" value="20,40"></div>
+        <div class="field field-gap"><label class="f-label" for="accuracy">正确率(100 或 70,100;留空保留原值):</label>
+          <input type="text" id="accuracy" placeholder="留空则只刷时长"></div>
+        <div class="field field-gap"><label class="f-label" for="workers">并发计时小节数(1-4):</label>
+          <input type="number" id="workers" min="1" max="4" step="1" value="1"></div>
       </div>
     </section>
   </div>
@@ -594,7 +659,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
 'use strict';
 var lastSeq = 0;
 var courses = [];
-var modeSwitching = false;
 window.__hasTask = false;
 var $ = function (id) { return document.getElementById(id); };
 
@@ -604,31 +668,12 @@ function apiPost(path, body) {
     .then(function (r) { return r.json(); });
 }
 
-function getMode() {
-  var checked = document.querySelector('input[name=mode]:checked');
-  return checked ? checked.value : 'accuracy';
-}
-
-function setModeLabel() {
-  $('paramLabel').textContent = getMode() === 'time'
-    ? '每练习时长秒(30 或 10,30):' : '正确率(100 或 70,100):';
-}
-
-function selectMode(mode) {
-  var radio = document.querySelector('input[name=mode][value="' + mode + '"]');
-  if (radio) radio.checked = true;
-  setModeLabel();
-}
-
 function setControls(running) {
-  var busy = running || modeSwitching;
+  var busy = running;
   $('loginBtn').disabled = busy;
   $('refreshBtn').disabled = busy;
   $('startBtn').disabled = busy || !window.__hasTask;
   $('stopBtn').disabled = !busy;
-  document.querySelectorAll('input[name=mode]').forEach(function (radio) {
-    radio.disabled = busy;
-  });
   $('statusPill').classList.toggle('running', busy);
 }
 
@@ -815,8 +860,12 @@ function applyAllUnits() {
 function updateSummary() {
   var el = $('runSummary');
   if (!el) return;
-  var p = $('param').value.trim();
-  var suffix = p ? '(参数 ' + p + ')' : '';
+  var duration = $('duration').value.trim() || '20,40';
+  var accuracy = $('accuracy').value.trim();
+  var workers = $('workers').value.trim() || '1';
+  var suffix = '(时长 ' + duration
+    + (accuracy ? ' / 正确率 ' + accuracy : ' / 保留正确率')
+    + ' / 并发 ' + workers + ')';
   if ($('allUnits').checked) {
     el.textContent = '全部单元' + suffix;
     return;
@@ -928,50 +977,13 @@ function refreshAll(kind) {
     });
 }
 
-document.querySelectorAll('input[name=mode]').forEach(function (radio) {
-  radio.addEventListener('change', function () {
-    var newMode = getMode();
-    var previousMode = newMode === 'time' ? 'accuracy' : 'time';
-    setModeLabel();
-    if (!window.__hasTask) {
-      appendLocal('已切换模式,登录后生效');
-      return;
-    }
-
-    modeSwitching = true;
-    setControls(false);
-    apiPost('/api/mode', {mode: newMode})
-      .then(function (j) {
-        if (!j.ok) {
-          selectMode(previousMode);
-          alert('切换模式失败\n' + j.error);
-          modeSwitching = false;
-          setControls(false);
-          return;
-        }
-        appendLocal('已切换模式,无需重新登录');
-        modeSwitching = false;
-        setControls(false);
-      })
-      .catch(function () {
-        selectMode(previousMode);
-        apiPost('/api/mode', {mode: previousMode})
-          .catch(function () {})
-          .then(function () {
-            modeSwitching = false;
-            setControls(false);
-          });
-      });
-  });
-});
-
 $('loginBtn').addEventListener('click', function () {
   var username = $('username').value.trim();
   var password = $('password').value;
   if (!username || !password) { alert('请输入账号和密码'); return; }
   var prevCourse = $('courseSel').value;
   var prevSel = buildSelection();
-  apiPost('/api/login', {username: username, password: password, mode: getMode()})
+  apiPost('/api/login', {username: username, password: password, mode: 'combined'})
     .then(function (j) {
       if (!j.ok) { alert('登录失败\n' + j.error); return; }
       window.__hasTask = true;
@@ -1019,7 +1031,9 @@ $('courseSel').addEventListener('change', function () {
 });
 
 $('allUnits').addEventListener('change', applyAllUnits);
-$('param').addEventListener('input', updateSummary);
+$('duration').addEventListener('input', updateSummary);
+$('accuracy').addEventListener('input', updateSummary);
+$('workers').addEventListener('input', updateSummary);
 $('clearBtn').addEventListener('click', function () { $('log').innerHTML = ''; });
 
 $('startBtn').addEventListener('click', function () {
@@ -1030,7 +1044,9 @@ $('startBtn').addEventListener('click', function () {
   }
   var body = {units: sel.allUnits ? 0 : sel.units,
               sections: sel.allUnits ? null : sel.sections,
-              param: $('param').value};
+              duration: $('duration').value,
+              accuracy: $('accuracy').value,
+              parallel_workers: Number($('workers').value || 1)};
   apiPost('/api/start', body)
     .then(function (j) {
       if (!j.ok) { alert(j.error); return; }
@@ -1074,7 +1090,6 @@ function poll() {
       }
       wasRunning = j.running;
       window.__hasTask = j.has_task;
-      if (j.has_task && j.mode && !modeSwitching) selectMode(j.mode);
       $('statusText').textContent = j.running_what;
       setControls(j.running);
     })

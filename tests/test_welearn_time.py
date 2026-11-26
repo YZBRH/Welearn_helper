@@ -3,6 +3,7 @@ import threading
 import time
 
 from tests.fakes import FakeResponse, FakeSession
+import welearn_study
 import welearn_time
 
 
@@ -96,6 +97,112 @@ class TestRun:
         assert result["failed"] == 1
         assert result["errors"] == ["BadChapter"]
 
+    def test_submits_accuracy_after_study_duration(self):
+        fake = FakeSession()
+
+        def sco_response(url, data):
+            action = data["action"]
+            if action == "getscoinfo_v7":
+                return FakeResponse(
+                    json_data={
+                        "comment": json.dumps({
+                            "cmi": {
+                                "session_time": "00:00:04",
+                                "total_time": "00:01:00",
+                            }
+                        })
+                    }
+                )
+            if action == "keepsco_with_getticket_with_updatecmitime":
+                return FakeResponse(json_data={"ret": 0, "seconds": 0})
+            return FakeResponse(text='{"ret":0}')
+
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = sco_response
+        task = make_task(fake, [
+            {"id": 1, "location": "A", "learntime": 0,
+             "isvisible": "true", "iscomplete": "未完成"},
+        ])
+        task.accuracy_section_gap_seconds = (0, 0)
+
+        result = task.run(1, 1, accuracy=88)
+
+        assert result["accuracy_submitted"] is True
+        assert result["way1_succeed"] == 1
+        assert result["way2_succeed"] == 1
+        actions = [
+            request[2]["action"] for request in fake.requests
+            if request[1] == "https://welearn.sflep.com/Ajax/SCO.aspx"
+        ]
+        assert actions == [
+            "getscoinfo_v7",
+            "keepsco_with_getticket_with_updatecmitime",
+            "keepsco_with_getticket_with_updatecmitime",
+            "startsco160928",
+            "setscoinfo",
+            "savescoinfo160928",
+        ]
+        setsco_data = next(
+            request[2]["data"] for request in fake.requests
+            if request[2] and request[2].get("action") == "setscoinfo"
+        )
+        cmi = json.loads(setsco_data.split("[INTERACTIONINFO]")[0])["cmi"]
+        assert cmi["score"]["scaled"] == "88"
+        assert cmi["session_time"] == "00:00:05"
+        assert cmi["total_time"] == "00:01:01"
+
+    def test_accuracy_only_keeps_original_default_duration(self):
+        task = welearn_time.TimeTask("u", "p", on_log=lambda m: None)
+        captured = {}
+
+        def fake_run_study(units, **kwargs):
+            captured.update(units=units, **kwargs)
+            return {
+                "total": 0,
+                "succeed": 0,
+                "failed": 0,
+                "errors": [],
+                "accuracy_submitted": kwargs.get("accuracy") is not None,
+                "way1_succeed": 0,
+                "way1_failed": 0,
+                "way2_succeed": 0,
+                "way2_failed": 0,
+            }
+
+        task.run_study = fake_run_study
+        task.run(1, None, accuracy=88)
+
+        assert captured["duration"] == welearn_study.DEFAULT_STUDY_SECONDS
+        assert captured["accuracy"] == 88
+        assert captured["skip_completed"] is True
+        assert captured["probe_all_units"] is True
+
+    def test_explicit_duration_processes_completed_sections(self):
+        task = welearn_time.TimeTask("u", "p", on_log=lambda m: None)
+        captured = {}
+
+        def fake_run_study(units, **kwargs):
+            captured.update(units=units, **kwargs)
+            return {
+                "total": 0,
+                "succeed": 0,
+                "failed": 0,
+                "errors": [],
+                "accuracy_submitted": kwargs.get("accuracy") is not None,
+                "way1_succeed": 0,
+                "way1_failed": 0,
+                "way2_succeed": 0,
+                "way2_failed": 0,
+            }
+
+        task.run_study = fake_run_study
+        task.run(1, 30, accuracy=88, parallel_workers=3)
+
+        assert captured["duration"] == 30
+        assert captured["accuracy"] == 88
+        assert captured["parallel_workers"] == 3
+        assert captured["skip_completed"] is False
+        assert captured["probe_all_units"] is False
+
     def test_stop_interrupts_quickly(self):
         fake = FakeSession()
         fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = ok_ajax_response()
@@ -154,3 +261,49 @@ class TestMultiSelect:
         saved = [r[2]["scoid"] for r in fake.requests
                  if r[2] and r[2].get("action") == "savescoinfo160928"]
         assert sorted(saved) == [101, 202]
+
+
+class TestParallelSections:
+    def test_two_workers_overlap_study_timers(self):
+        fake = FakeSession()
+        task = make_task(fake, [])
+        fake.routes["https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"] = \
+            FakeResponse(json_data={"info": [
+                {"id": i, "location": f"L{i}", "learntime": 0,
+                 "isvisible": "true", "iscomplete": "未完成"}
+                for i in range(1, 5)
+            ]})
+        task.units = [{"unitname": "U1", "name": "Unit One"}]
+        barrier = threading.Barrier(2)
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def fake_submit(course, duration, accuracy, headers):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            barrier.wait(timeout=2)
+            with lock:
+                active -= 1
+            return {
+                "crate": "",
+                "duration": duration,
+                "setsco_ok": None,
+                "savesco_ok": True,
+            }
+
+        task._submit_section = fake_submit
+        result = task.run(1, 1, parallel_workers=2)
+
+        assert max_active == 2, result
+        assert result["total"] == 4
+        assert result["succeed"] == 4
+
+    def test_rejects_workers_outside_supported_range(self):
+        import pytest
+        task = welearn_time.TimeTask("u", "p", on_log=lambda m: None)
+        task.units = [{}]
+        with pytest.raises(ValueError, match="1~4"):
+            task.run(1, 1, parallel_workers=5)

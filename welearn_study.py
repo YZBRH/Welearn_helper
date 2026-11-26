@@ -1,5 +1,6 @@
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from random import randint
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -19,8 +20,10 @@ SCO_DATA_TEMPLATE = (
     '"submit_time":""}}[INTERACTIONINFO]'
 )
 
+DEFAULT_STUDY_SECONDS = (20, 40)
 DEFAULT_SECTION_GAP_SECONDS = (4, 10)
 KEEPALIVE_EVERY = 60
+MAX_PARALLEL_WORKERS = 4
 
 NumericSpan = Union[int, Tuple[int, int]]
 
@@ -42,6 +45,7 @@ class StudyTask:
         self.on_log = on_log or _default_log
         self.stop_event = stop_event or threading.Event()
         self.session = session or welearn_common.new_session()
+        self._request_lock = threading.RLock()
         self.request_interval = request_interval
         self.cid = ""
         self.uid = ""
@@ -53,6 +57,14 @@ class StudyTask:
 
     def _wait(self, seconds: float) -> bool:
         return not self.stop_event.wait(max(0.0, float(seconds)))
+
+    def _get(self, url: str, **kwargs):
+        with self._request_lock:
+            return self.session.get(url, **kwargs)
+
+    def _post(self, url: str, **kwargs):
+        with self._request_lock:
+            return self.session.post(url, **kwargs)
 
     @staticmethod
     def _sample_span(span: NumericSpan) -> int:
@@ -142,7 +154,7 @@ class StudyTask:
 
     def fetch_units(self, cid) -> List[dict]:
         self.cid = str(cid)
-        self.session.get(
+        self._get(
             "https://welearn.sflep.com/2019/student/course_info.aspx?cid=" + self.cid,
             headers={"Referer": "https://welearn.sflep.com/2019/student/index.aspx"},
         )
@@ -156,7 +168,7 @@ class StudyTask:
         )
 
     def _read_study_session(self, common_data: dict, headers: dict) -> Dict[str, str]:
-        response = self.session.post(
+        response = self._post(
             AJAX_URL,
             data={**common_data, "action": "getscoinfo_v7"},
             headers=headers,
@@ -164,12 +176,12 @@ class StudyTask:
         if "学习数据不正确" in response.text:
             if not self._wait(self.request_interval):
                 raise WelearnError("已停止")
-            self.session.post(
+            self._post(
                 AJAX_URL,
                 data={**common_data, "action": "startsco160928"},
                 headers=headers,
             )
-            response = self.session.post(
+            response = self._post(
                 AJAX_URL,
                 data={**common_data, "action": "getscoinfo_v7"},
                 headers=headers,
@@ -180,7 +192,7 @@ class StudyTask:
 
     def _keepalive(self, common_data: dict, headers: dict,
                    session_time: str, total_time: str):
-        return self.session.post(
+        return self._post(
             AJAX_URL,
             data={
                 **common_data,
@@ -248,7 +260,7 @@ class StudyTask:
             crate = str(accuracy)
             cstatus = "completed"
             progress = "100"
-            self.session.post(
+            self._post(
                 AJAX_URL,
                 data={**common_data, "action": "startsco160928"},
                 headers=headers,
@@ -259,7 +271,7 @@ class StudyTask:
                 .replace("{session_time}", cmi["session_time"])
                 .replace("{total_time}", cmi["total_time"])
             )
-            response = self.session.post(
+            response = self._post(
                 AJAX_URL,
                 data={
                     **common_data,
@@ -271,7 +283,7 @@ class StudyTask:
             )
             setsco_ok = self._response_ok(response)
 
-        response = self.session.post(
+        response = self._post(
             AJAX_URL,
             data={
                 **common_data,
@@ -296,7 +308,15 @@ class StudyTask:
                   sections=None,
                   section_gap: NumericSpan = (0, 0),
                   skip_completed: bool = False,
-                  probe_all_units: bool = False) -> Dict[str, Any]:
+                  probe_all_units: bool = False,
+                  parallel_workers: int = 1) -> Dict[str, Any]:
+        try:
+            workers = int(parallel_workers)
+        except (TypeError, ValueError):
+            raise ValueError("并发小节数必须是整数")
+        if not 1 <= workers <= MAX_PARALLEL_WORKERS:
+            raise ValueError(f"并发小节数必须在 1~{MAX_PARALLEL_WORKERS} 之间")
+
         all_units, unit_list, section_map = welearn_common.normalize_targets(units, sections)
         info_headers = {
             "Referer": f"https://welearn.sflep.com/2019/student/course_info.aspx?cid={self.cid}"
@@ -307,16 +327,19 @@ class StudyTask:
             "failed": 0,
             "errors": [],
             "skipped": 0,
+            "accuracy_submitted": accuracy is not None,
             "way1_succeed": 0,
             "way1_failed": 0,
             "way2_succeed": 0,
             "way2_failed": 0,
         }
+        stats_lock = threading.Lock()
+        pending: List[Tuple[dict, dict]] = []
         sections_found = 0
 
         def process_unit(unit_idx: int, unit_no: int) -> bool:
             nonlocal sections_found
-            response = self.session.get(
+            response = self._get(
                 "https://welearn.sflep.com/ajax/StudyStat.aspx?action=scoLeaves"
                 f"&cid={self.cid}&uid={self.uid}&unitidx={unit_idx}&classid={self.classid}",
                 headers=info_headers,
@@ -341,41 +364,55 @@ class StudyTask:
                     self.on_log(f'[ 已完成 ]    {course["location"]}')
                     continue
 
-                sampled_duration = self._sample_span(duration)
-                sampled_accuracy = (
-                    self._sample_span(accuracy) if accuracy is not None else None
-                )
-                if accuracy is not None:
-                    self.on_log(f'[即将完成]    {course["location"]}')
-                else:
-                    self.on_log(f'章节 : {course["location"]}')
-                    self.on_log(
-                        f'已学 : {course.get("learntime", "00:00:00")} '
-                        f'将学 : {sampled_duration}'
-                    )
                 headers = {
                     "Referer": (
                         "https://welearn.sflep.com/Student/StudyCourse.aspx"
                         f"?cid={self.cid}&classid={self.classid}&sco={course['id']}"
                     )
                 }
-                try:
-                    result = self._submit_section(
-                        course, sampled_duration, sampled_accuracy, headers
-                    )
-                except WelearnError as error:
-                    if str(error) == "已停止":
-                        return True
+                pending.append((course, headers))
+            return True
+
+        def submit_item(item: Tuple[dict, dict]) -> None:
+            course, headers = item
+            if self._stopped():
+                return
+
+            sampled_duration = self._sample_span(duration)
+            sampled_accuracy = (
+                self._sample_span(accuracy) if accuracy is not None else None
+            )
+            if accuracy is not None:
+                self.on_log(
+                    f'[即将完成]    {course["location"]}  '
+                    f'学习 {sampled_duration} 秒后提交正确率 {sampled_accuracy}%'
+                )
+            else:
+                self.on_log(f'章节 : {course["location"]}')
+                self.on_log(
+                    f'已学 : {course.get("learntime", "00:00:00")} '
+                    f'将学 : {sampled_duration}'
+                )
+
+            try:
+                result = self._submit_section(
+                    course, sampled_duration, sampled_accuracy, headers
+                )
+            except WelearnError as error:
+                if str(error) == "已停止":
+                    return
+                with stats_lock:
                     stats["total"] += 1
                     stats["failed"] += 1
                     stats["errors"].append(course["location"])
                     stats["way1_failed"] += 1
                     stats["way2_failed"] += 1
-                    self.on_log(f'[!] {course["location"]}: {error}')
-                    continue
-                if result is None:
-                    return True
+                self.on_log(f'[!] {course["location"]}: {error}')
+                return
+            if result is None:
+                return
 
+            with stats_lock:
                 stats["total"] += 1
                 if result["setsco_ok"] is True:
                     stats["way1_succeed"] += 1
@@ -389,19 +426,18 @@ class StudyTask:
                     stats["errors"].append(course["location"])
                     stats["way2_failed"] += 1
 
-                if accuracy is not None:
-                    self.on_log(
-                        f'>>>>>>>>>>>>>>正确率:{str(sampled_accuracy):>3}%  '
-                        f'方式1:{"成功!!!" if result["setsco_ok"] else "失败!!!"}  '
-                        f'方式2:{"成功!!!" if result["savesco_ok"] else "失败!!!"}'
-                    )
-                else:
-                    self.on_log(f'[ 完成 ]    {course["location"]}')
+            if accuracy is not None:
+                self.on_log(
+                    f'>>>>>>>>>>>>>>正确率:{str(sampled_accuracy):>3}%  '
+                    f'方式1:{"成功!!!" if result["setsco_ok"] else "失败!!!"}  '
+                    f'方式2:{"成功!!!" if result["savesco_ok"] else "失败!!!"}'
+                )
+            else:
+                self.on_log(f'[ 完成 ]    {course["location"]}')
 
-                gap = self._sample_span(section_gap)
-                if gap and not self._wait(gap):
-                    return True
-            return True
+            gap = self._sample_span(section_gap)
+            if gap:
+                self._wait(gap)
 
         if all_units and probe_all_units:
             unit_idx = 0
@@ -417,6 +453,13 @@ class StudyTask:
                 if not process_unit(unit_idx, unit_idx + 1):
                     if not all_units:
                         self.on_log(f"[!] 单元 {unit_idx + 1} 不可用,已跳过")
+
+        if workers == 1:
+            for item in pending:
+                submit_item(item)
+        elif pending:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                list(executor.map(submit_item, pending))
 
         if section_map and sections_found == 0:
             self.on_log("[!] 未找到任何指定小节(编号超出所选单元的小节范围)")

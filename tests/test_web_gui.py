@@ -41,10 +41,16 @@ class FakeTask:
         return [{"location": "U1 > A", "iscomplete": "completed", "isvisible": "true"},
                 {"location": "U1 > B", "iscomplete": "未完成", "isvisible": "false"}]
 
-    def run(self, units, param, sections=None):
+    def run(self, units, param, sections=None, accuracy=None,
+            parallel_workers=1):
         self.last_run_args = (units, param, sections)
+        self.last_accuracy = accuracy
+        self.last_parallel_workers = parallel_workers
         time.sleep(0.2)   # 让"任务运行中"状态可被观测,避免与断言竞态
-        self.on_log(f"fake run units={units} param={param} sections={sections}")
+        self.on_log(
+            f"fake run units={units} param={param} sections={sections} "
+            f"accuracy={accuracy}"
+        )
         return {"way1_succeed": 1, "way1_failed": 0,
                 "way2_succeed": 1, "way2_failed": 0}
 
@@ -207,19 +213,14 @@ class TestPageJs:
         body = c.get("/").get_data(as_text=True)
         assert "alert('登录失败\\n'" in body   # 必须是字面量 反斜杠+n
 
-    def test_mode_switch_reuses_login_without_logout(self, client):
+    def test_page_has_unified_duration_and_accuracy_fields(self, client):
         c, _ = client
         body = c.get("/").get_data(as_text=True)
-        selector = "document.querySelectorAll('input[name=mode]')"
-        first = body.index(selector)
-        start = body.index(selector, first + len(selector))
-        end = body.index("$('loginBtn')", start)
-        handler = body[start:end]
-        assert "/api/mode" in handler
-        assert "/api/logout" not in handler
-        assert "无需重新登录" in handler
-        assert "fillCourses([])" not in handler
-        assert "resetTree()" not in handler
+        assert 'id="duration"' in body
+        assert 'id="accuracy"' in body
+        assert 'id="workers"' in body
+        assert 'input type="radio" name="mode"' not in body
+        assert "mode: 'combined'" in body
 
 
 class TestQuietStatusPoll:
@@ -296,6 +297,54 @@ class TestStartSection:
                                        "section_index": 99})
         assert r.status_code == 400
         assert "1~2" in r.get_json()["error"]
+
+
+class TestCombinedStart:
+    def test_duration_and_accuracy_are_passed_to_unified_task(
+            self, client, monkeypatch):
+        monkeypatch.setattr(welearn_time, "TimeTask", FakeTask)
+        c, state = client
+        r = c.post(
+            "/api/login",
+            json={"username": "u", "password": "p", "mode": "combined"},
+        )
+        assert r.get_json()["ok"] is True
+        c.post("/api/units", json={"cid": 11})
+
+        j = c.post(
+            "/api/start",
+            json={"units": [1], "duration": "30", "accuracy": "88",
+                  "parallel_workers": 3},
+        ).get_json()
+
+        assert j["ok"] is True
+        state.worker.join(timeout=5)
+        task = FakeTask.instances[-1]
+        assert task.last_run_args == ([1], 30, None)
+        assert task.last_accuracy == 88
+        assert task.last_parallel_workers == 3
+
+    def test_duration_can_use_default_when_only_accuracy_is_filled(
+            self, client, monkeypatch):
+        monkeypatch.setattr(welearn_time, "TimeTask", FakeTask)
+        c, state = client
+        c.post(
+            "/api/login",
+            json={"username": "u", "password": "p", "mode": "combined"},
+        )
+        c.post("/api/units", json={"cid": 11})
+
+        j = c.post(
+            "/api/start",
+            json={"units": [1], "duration": "", "accuracy": "70,100"},
+        ).get_json()
+
+        assert j["ok"] is True
+        state.worker.join(timeout=5)
+        task = FakeTask.instances[-1]
+        assert task.last_run_args == ([1], None, None)
+        assert task.last_accuracy == (70, 100)
+        assert task.last_parallel_workers == 1
 
 
 class TestRefreshAfterTaskEnd:
