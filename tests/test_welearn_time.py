@@ -58,6 +58,34 @@ class TestRun:
         assert result["failed"] == 0
         assert result["succeed"] == 2
 
+    def test_preserves_existing_accuracy_and_status(self):
+        fake = FakeSession()
+        cmi = {
+            "score": {"scaled": "87"},
+            "completion_status": "completed",
+            "progress_measure": "1",
+            "total_time": "00:20:00",
+            "session_time": "00:05:00",
+        }
+        fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = FakeResponse(
+            json_data={"ret": 0, "comment": json.dumps({"cmi": cmi})}
+        )
+        task = make_task(fake, [
+            {"id": 1, "location": "A", "learntime": "00:20:00",
+             "isvisible": "true", "iscomplete": "已完成"},
+        ])
+        result = task.run(1, 0)
+
+        assert result["succeed"] == 1
+        posts = [r[2] for r in fake.requests
+                 if r[1] == "https://welearn.sflep.com/Ajax/SCO.aspx"]
+        actions = [post["action"] for post in posts]
+        assert "setscoinfo" not in actions
+        save = next(post for post in posts if post["action"] == "savescoinfo160928")
+        assert save["crate"] == "87"
+        assert save["cstatus"] == "completed"
+        assert save["progress"] == "1"
+
     def test_bad_sco_recorded_as_error(self):
         fake = FakeSession()
         fake.routes["https://welearn.sflep.com/Ajax/SCO.aspx"] = \
