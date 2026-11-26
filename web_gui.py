@@ -16,11 +16,12 @@ from flask import Flask, jsonify, request
 import welearn_accuracy
 import welearn_common
 import welearn_time
+from version import __version__
 from welearn_common import LoginError, WelearnError
 from welearn_study import MAX_PARALLEL_WORKERS
 
-BANNER = """**********  Created By Avenshy & SSmJaE  **********
-                    Web界面Version:1.0
+BANNER = f"""**********  Created By Avenshy & SSmJaE  **********
+                    Web界面Version:{__version__}
         原项目作者github https://github.com/Avenshy
         更新维护者github https://github.com/YZBRH
                         https://github.com/lxbsdsg

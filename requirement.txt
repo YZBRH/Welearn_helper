@@ -1,6 +1,4 @@
 requests
-asyncio
-bs4
-typing
+beautifulsoup4
 tls_client
-flask
+Flask
